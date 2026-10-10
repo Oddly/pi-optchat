@@ -72,6 +72,7 @@ export class Children {
   private readonly running = new Map<string, LiveRun>();
   readonly history: RunHistory;
   private readonly listeners = new Set<() => void>();
+  private readonly views = new Map<string, symbol>();
   private closing = false;
   private launching = 0;
   private readonly resuming = new Set<string>();
@@ -98,6 +99,14 @@ export class Children {
   get ids() { return [...this.running.keys()]; }
   get active() { return this.completions.size > 0 || this.launching > 0 || this.settling > 0; }
   live(id: string) { return this.running.get(id); }
+  isViewed(id: string) { return this.views.has(id); }
+  /** One interactive view per run, shared by the main inspector and attached terminals. Never owns the run itself. */
+  claimView(id: string) {
+    if (!this.history.records.has(id) || this.deleting.has(id)) throw new Error(`No subagent ${id} available to open`);
+    if (this.views.has(id)) throw new Error(`Subagent ${id} is already open in another window. Close that view before opening it here.`);
+    const token = Symbol(id); this.views.set(id, token); this.changed();
+    return () => { if (this.views.get(id) === token) { this.views.delete(id); this.changed(); } };
+  }
   collectUsage() {
     for (const live of this.running.values()) this.options.usage?.backfill(live.session.sessionManager.getEntries(), live.info.parentSession, 'subagent', live.info.id);
   }

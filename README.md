@@ -8,7 +8,7 @@ A Pi extension that implements [Victor Taelin's OptChat recipe](https://gist.git
 - **Profiles**: separate memories and instructions, such as `work` and `personal`.
 - **Subagents**: delegate tasks to background agents, inspect them live, and send them guidance.
 - **Import**: bring in history from Claude Code (conversations and memories), Codex, Pi and [OMP](https://github.com/can1357/oh-my-pi), or ChatGPT.
-- **Connected windows**: a second Pi window on the same profile becomes a subagent you talk to directly.
+- **Connected windows**: a second Pi window on the same profile becomes a subagent you talk to directly, or opens an existing background subagent with `--optchat-agent`.
 
 It runs inside ordinary Pi, with no fork or separate launcher.
 
@@ -54,7 +54,7 @@ If that profile is open in another Pi, `pi -p` joins it like a connected window:
 | `/optchat instructions` | Edit this profile's `AGENTS.md`. |
 | `/optchat browse` | Open a readable snapshot of memory: the shape of what the model sees, summaries you can open down to the original messages, and search that shows where each message is folded. Run again to refresh. |
 | `/optchat import` | Import history, or resume/discard a paused import. |
-| `/complete` | In a connected window: end the conversation and hand off to the main agent. |
+| `/complete` | In a connected window: end the conversation and hand off to the main agent. With `--optchat-agent`: detach only, leaving the background agent running. |
 | `/tell-main <message>` | In a connected window: message the main agent. |
 
 ## Models
@@ -175,6 +175,36 @@ Pick the destination profile, then run `/optchat import`.
 Damaged or unsupported records are listed before you start, so you can cancel or continue without them. Conversations that disappear during the scan are skipped with a warning.
 
 See OpenAI's guides on [exporting ChatGPT data](https://help.openai.com/en/articles/7260999-exporting-your-chatgpt-history-and-data) and the [conversation file format](https://help.openai.com/en/articles/9106926-transfer-exported-conversations-between-chatgpt-accounts).
+
+## Open an existing background agent in another terminal
+
+Open the same profile normally in the second terminal:
+
+```sh
+pi --optchat-profile work
+```
+
+First configure an accessible subagent model in the main window with `/optchat agents model` and ask the main agent to start a background task. Typing in **Start a connected subagent conversation here** instead creates a conversation owned by that terminal, so it is not an unopened background agent. If no eligible background agent exists, the menu explains this rather than adding an agent row.
+
+When the profile is already open, the menu offers **Start a connected subagent conversation here**, followed by **Open subagent <id> · <state> · <task>** for each available background agent. Only live running, waiting or paused agents with no conversation view open are listed. An agent open in the main inspector or another terminal is omitted. Selecting it opens that existing session, not a new subagent. If another window opens it while the menu is on screen, the selection is refused and the menu refreshes.
+
+You can also skip the menu with the exact ID shown in the main window's **Agents** inspector or subagent report:
+
+```sh
+pi --optchat-profile work --optchat-agent 8ab62e89
+```
+
+This opens that **same agent's existing session** as a normal Pi chat in the second terminal: its task, previous replies and tool results, followed by live output. Messages you type are direct user guidance to that agent, not tasks for a new subagent. A paused agent continues when you send a message. `/tell-main` still contacts the main agent.
+
+- The original Pi process must stay open and support this option too. It remains the only profile writer and execution host; attaching is not a detached worker or a second copy of the session.
+- Each agent can have one conversation view open at a time (main inspector or attached terminal). Close that view before opening it elsewhere. Merely selecting an agent in the inspector list does not claim it.
+- No new agent, model call, or agent slot is created merely by opening the window. Reports still go to the agent's original parent.
+- **Closing, force-quitting, or `/complete` only detaches this window. It does not stop the background agent or prepare a new handoff.** Stop or interrupt the agent from the original window's Agents inspector.
+- A finished agent opens for reading without being restarted. Ask its original parent to resume it before attaching for more work.
+- This requires interactive Pi, a profile, and an exact background-agent ID. An unknown ID, missing owner, or connected-window-owned conversation is refused rather than creating a new conversation.
+- The local Pi session saves its profile and agent binding: `pi --resume` reconnects that window to the same agent while the owner is open. The agent ID itself is **not** a Pi session ID; do not use `pi --session 8ab62e89`.
+
+The original window still manages agents, settings and memory. This option opens an existing chat directly; it does not enable `/optchat agents` in connected windows.
 
 ## Connected windows
 

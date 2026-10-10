@@ -26,7 +26,7 @@ import { UsageLedger } from './usage.ts';
 import { oneLine, showInspector, type InspectorPage } from './inspector.ts';
 import { showAgentView } from './agent-view.ts';
 import { inspectorShortcut, mountNavigation } from './navigation.ts';
-import { joinHeadless, serveWindows } from './window-bridge.ts';
+import { joinHeadless, listAttachableAgents, serveWindows } from './window-bridge.ts';
 import { openConnectedWindow, registerConnectedRenderer } from './connected-window.ts';
 import { createHandoffSummarizer } from './handoff.ts';
 import { mainTitle, TabTitle } from './title.ts';
@@ -99,6 +99,7 @@ export default function optchat(pi: ExtensionAPI) {
   const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
   pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
   pi.registerFlag('optchat-connect', { description: 'pi -p on a profile open in another Pi: auto (join it if busy, default), join (only join), off (error if busy)', type: 'string', default: 'auto' });
+  pi.registerFlag('optchat-agent', { description: 'Open an existing background agent by exact ID in this terminal (TUI only; requires a running profile owner)', type: 'string' });
   const connectMode = () => {
     const mode = pi.getFlag('optchat-connect') ?? 'auto';
     const known = CONNECT_MODES.find(m => m === mode);
@@ -243,12 +244,29 @@ export default function optchat(pi: ExtensionAPI) {
     stopping = false;
     const entries = ctx.sessionManager.getEntries();
     const saved = entries.findLast(e => e.type === 'custom' && e.customType === binding);
+    const boundAgent = saved?.type === 'custom' && record(saved.data) && typeof saved.data.agentId === 'string' ? saved.data.agentId : undefined;
     const boundName = saved?.type === 'custom' && record(saved.data) && typeof saved.data.name === 'string' ? saved.data.name : undefined;
     // A session with conversation in it belongs to its profile. One that is only bound (a fresh `/optchat profile` session) may still pick another.
     const settled = boundName !== undefined && entries.some(e => e.type === 'message' || e.type === 'custom_message');
     const flag = pi.getFlag('optchat-profile');
     try {
       if (boundName && typeof flag === 'string' && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
+      const requestedAgent = pi.getFlag('optchat-agent');
+      if (boundAgent && requestedAgent !== undefined && requestedAgent !== boundAgent) throw new Error(`Session belongs to agent ${boundAgent}; open a new Pi session for another agent.`);
+      const agentId = requestedAgent ?? boundAgent;
+      if (agentId !== undefined) {
+        if (typeof agentId !== 'string' || !agentId.trim()) throw new Error('--optchat-agent requires an exact agent ID');
+        if (ctx.mode !== 'tui') { process.exitCode = 1; throw new Error('--optchat-agent requires interactive Pi (not print, JSON or RPC mode)'); }
+        if (settled && !boundAgent) throw new Error('This session already contains a main conversation. Open the agent in a fresh Pi session.');
+        const name = boundName ?? (typeof flag === 'string' ? flag : undefined);
+        if (!name) throw new Error('--optchat-agent needs a profile: pass --optchat-profile');
+        remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId);
+        fault = undefined;
+        if (name !== boundName || agentId !== boundAgent) pi.appendEntry(binding, { name, agentId });
+        // Pi sets its own title after session_start; retain the attached window title too.
+        for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
+        return;
+      }
       let name = boundName ?? (typeof flag === 'string' ? flag : await chooseProfile(ctx));
       // Only plain `pi -p` joins: JSON and RPC output carry Pi's own events, which a joined reply would bypass.
       const connect = ctx.mode === 'print' ? connectMode() : 'off';
@@ -263,7 +281,26 @@ export default function optchat(pi: ExtensionAPI) {
           if (error instanceof ProfileBusyError && connect === 'auto') { joined = await joinProfile(name); break; }
           if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
           // A resumed conversation already belongs to this profile, so another profile needs a new session (/optchat profile).
-          const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, settled ? [CONNECT] : [CONNECT, BACK]);
+          // Older owners have no listing protocol. Keep their existing Connect/Back menu rather than failing startup.
+          const listed = settled ? undefined : await listAttachableAgents(profilePath(name)).catch(() => undefined);
+          const agents = listed ?? [];
+          const hint = listed?.length === 0 ? '\nNo unopened background agents are running. Ask the main agent to start one; already-open agents are hidden.' : '';
+          const labels = new Map(agents.map(agent => [`Open subagent ${agent.id} · ${agent.state} · ${oneLine(agent.task).slice(0, 80)}`, agent.id]));
+          const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}${hint}`,
+            [CONNECT, ...labels.keys(), ...(settled ? [] : [BACK])]);
+          const agentId = choice && labels.get(choice);
+          if (agentId) {
+            try {
+              remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId);
+              fault = undefined; pi.appendEntry(binding, { name, agentId });
+              // Keep the specific agent binding instead of overwriting it below with just the profile.
+              for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
+              return;
+            } catch (error) {
+              ctx.ui.notify(errorText(error), 'error');
+              continue; // Another view may have claimed it while the menu was open: refresh, never spawn a replacement.
+            }
+          }
           if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
           if (choice !== BACK) throw error;
           name = await chooseProfile(ctx);

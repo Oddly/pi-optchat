@@ -75,7 +75,7 @@ class LiveTurn implements Component {
   dispose() { clearInterval(this.timer); this.loader.stop(); }
 }
 
-export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title)) {
+export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title), agentId?: string) {
   // Each window draws with its own transcript, so nothing from an earlier window carries over.
   transcript = undefined;
   let started = false, ended = false, liveTurn: LiveTurn | undefined, live: LiveState | undefined, turn: AgentMessage[] = [];
@@ -95,7 +95,7 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
   const connection = await connectWindow(profilePath(profile), event => {
     if (event.name === 'started') {
       started = true; showLive(); title('working');
-      ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected agent ${event.text} · /complete`);
+      ctx.ui.setStatus('optchat', `OptChat: ${profile} · ${agentId ? 'attached' : 'connected'} agent ${event.text} · /complete`);
     } else if (event.name === 'status') {
       live = event.live; refresh();
       // The tab says working exactly when the spinner spins.
@@ -119,10 +119,21 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
     if (ended) return;
     ended = true; commit(); hideLive();
     ctx.ui.setStatus('optchat', `OptChat: ${profile} · disconnected`); title('disconnected');
-    ctx.ui.notify('Connection closed. The owner saves the interrupted conversation and handoff; no local agent will run here.', 'info');
+    ctx.ui.notify(agentId ? 'Detached from the background agent. Closing this window does not stop it; no local agent will run here.'
+      : 'Connection closed. The owner saves the interrupted conversation and handoff; no local agent will run here.', 'info');
+  }).catch((error: unknown) => {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+    throw agentId && (code === 'ENOENT' || code === 'ECONNREFUSED')
+      ? new Error('No running OptChat session on this profile. Start the original Pi window before attaching.') : error;
   });
-  ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected window · send a task to start`); title('waiting');
-  display(`Connected to ${profile}'s original window. Messages here go to one subagent using the profile's subagent model. /tell-main sends a message to the main agent; /complete ends this conversation and sends a handoff. Closing this window interrupts it.`);
+  if (agentId) {
+    display(`Opening existing agent ${agentId}. Messages go to that same agent; /tell-main contacts the main agent. /complete or closing this window only detaches. The original Pi window must remain open.`);
+    try { await connection.request('attach', agentId); }
+    catch (error) { ended = true; connection.close(); hideLive(); throw error; }
+  } else {
+    ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected window · send a task to start`); title('waiting');
+    display(`Connected to ${profile}'s original window. Messages here go to one subagent using the profile's subagent model. /tell-main sends a message to the main agent; /complete ends this conversation and sends a handoff. Closing this window interrupts it.`);
+  }
   return {
     async submit(text: string) {
       if (ended) throw new Error('Conversation ended. Open a new Pi window to start another.');
@@ -130,7 +141,7 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
     },
     async tell(text: string) { await connection.request('tell-main', text); },
     async complete() {
-      ctx.ui.setWorkingMessage('Ending conversation and preparing handoff…');
+      ctx.ui.setWorkingMessage(agentId ? 'Detaching from background agent…' : 'Ending conversation and preparing handoff…');
       try {
         if (started && !ended) await connection.request('complete');
         ended = true; connection.close(); ctx.shutdown();

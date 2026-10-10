@@ -4,14 +4,16 @@ import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { createAgentSession, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
 import { TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
+import { showAgentView } from '../src/agent-view.ts';
+import optchat from '../src/index.ts';
 import { Children } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
-import { serveWindows, connectWindow, joinHeadless, type WindowEvent } from '../src/window-bridge.ts';
+import { serveWindows, connectWindow, joinHeadless, listAttachableAgents, type WindowEvent } from '../src/window-bridge.ts';
 import { profileSocket, lockProfile, createProfile, profilePath } from '../src/profiles.ts';
 import { openConnectedWindow, registerConnectedRenderer } from '../src/connected-window.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
@@ -93,7 +95,7 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   const options = { settings: nested, parentSession: 'owner', usage: ledger, createSession: (options: Parameters<typeof createAgentSession>[0]) => createAgentSession({ ...options, modelRuntime: runtime }), summarizeHandoff: summarize };
   const children = new Children(memory, registry, choice, () => '', async text => { reports.push(text); }, text => warnings.push(text), dir, options);
   const unlock = await lockProfile(dir, 'test owner');
-  return { control, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, choice, options, ledger,
+  return { control, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, runtime, choice, options, ledger,
     async close() { await children.close(); await memory.close(); await unlock(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -557,3 +559,397 @@ for (const scenario of ['before-first-tick', 'after-reply', 'missing-transcript'
     } finally { interval.mock.restore(); client.close(); await close(); await f.close(); }
   });
 }
+
+test('attaching borrows an existing background session without spawning, changing its parent or claiming its lifetime', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+  const [id] = await f.children.spawn([{ task: 'hold work original background' }], f.dir);
+  await until(() => !!f.children.live(id)?.streaming);
+  const original = f.children.live(id)!.session;
+  const client = await connectWindow(f.dir, e => events.push(e), () => {});
+  try {
+    await client.request('attach', id);
+    assert.equal(events.find(e => e.name === 'started')?.text, id);
+    assert.equal(f.children.history.records.size, 1);
+    assert.equal(f.children.live(id)?.session, original);
+    assert.equal(f.children.history.records.get(id)?.connected, undefined);
+    assert.equal(f.children.history.records.get(id)?.parentId, undefined);
+    await until(() => events.some(e => e.live?.streaming));
+    assert.deepEqual(events.filter(e => e.from === 'user').map(e => e.text), ['hold work original background']);
+    assert.ok(!events.some(e => e.text.includes('<chat>')));
+    await client.request('say', 'Finish with evidence.');
+    assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.from, 'user');
+    await client.request('tell-main', 'I am reviewing this existing agent.');
+    assert.match(f.reports.at(-1) ?? '', /User message.*reviewing this existing agent/);
+    await client.request('complete');
+    await until(() => events.some(e => e.name === 'finished'));
+    assert.match(events.find(e => e.name === 'finished')?.text ?? '', /Detached/);
+    assert.equal(f.children.live(id)?.session, original);
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+    assert.equal(f.summaries.length, 0, 'detaching must not create a handoff');
+    assert.ok(!f.reports.some(t => t.includes('User started')));
+    await assert.rejects(client.request('say', 'Too late'), /closing/);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('closing an attached socket leaves background work running and allows reconnection', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work survives detach' }], f.dir);
+  const one = await connectWindow(f.dir, () => {}, () => {});
+  try {
+    await one.request('attach', id); one.close();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+    assert.equal(f.children.history.records.get(id)?.handoff, undefined);
+    const events: WindowEvent[] = [];
+    const two = await connectWindow(f.dir, e => events.push(e), () => {});
+    try {
+      await two.request('attach', id);
+      await until(() => events.some(e => e.live?.streaming));
+      assert.equal(f.children.history.records.size, 1);
+      assert.equal(events.find(e => e.name === 'started')?.text, id);
+    } finally { two.close(); }
+  } finally { one.close(); await close(); await f.close(); }
+});
+
+test('attachment replays real tool results and follows a paused background agent through its ordinary parent report', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+  const [id] = await f.children.spawn([{ task: 'descendant-evidence-task' }], f.dir);
+  await until(() => !!f.children.live(id)?.streaming && f.children.live(id)!.session.messages.some(m => m.role === 'toolResult'));
+  await f.children.interrupt(id);
+  await until(() => f.children.history.records.get(id)?.state === 'paused');
+  const client = await connectWindow(f.dir, e => events.push(e), () => {});
+  try {
+    await client.request('attach', id);
+    await until(() => events.some(e => e.live?.state === 'paused'));
+    assert.ok(events.some(e => e.message?.role === 'toolResult' && textContent(e.message.content).includes('DESCENDANT_TESTS_PASSED_123')));
+    await client.request('say', 'User: finish the original task.');
+    await until(() => events.some(e => e.name === 'finished'));
+    assert.equal(f.children.history.records.get(id)?.state, 'completed');
+    assert.equal(f.children.history.records.get(id)?.handoff, undefined);
+    assert.ok(f.reports.some(t => t.includes(`[${id}]`) && t.includes('finish the original task')));
+    assert.ok(events.some(e => e.from === 'agent' && e.text.includes('finish the original task')));
+    assert.equal(f.summaries.length, 0);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('a finished background transcript opens without a model call or implicit resume', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'Historical background result' }], f.dir);
+  await until(() => !f.children.live(id));
+  const calls = f.requests.length, reports = f.reports.length;
+  const client = await connectWindow(f.dir, e => events.push(e), () => {});
+  try {
+    await client.request('attach', id);
+    await until(() => events.some(e => e.name === 'finished'));
+    assert.ok(events.some(e => e.from === 'agent' && e.text.includes('Historical background result')));
+    assert.equal(f.requests.length, calls);
+    assert.equal(f.reports.length, reports);
+    assert.equal(f.children.history.records.size, 1);
+    await assert.rejects(client.request('say', 'Resume silently'), /closing/);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('attach rejects unknown IDs, invalid IDs, an importing owner, and conversations owned by another connected window', async () => {
+  const f = await fixture();
+  let available = true;
+  const close = await serveWindows(f.dir, f.children, () => available, async () => {});
+  const client = await connectWindow(f.dir, () => {}, () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work existing' }], f.dir);
+  try {
+    await assert.rejects(client.request('attach', '../../outside'), /exact agent ID/);
+    await assert.rejects(client.request('attach', 'missing'), /No subagent missing/);
+    await assert.rejects(client.request('attach', id.slice(0, 4)), /No subagent/, 'only exact IDs, never ambiguous prefixes');
+    available = false;
+    await assert.rejects(client.request('attach', id), /importing/);
+    available = true;
+    const [connected] = await f.children.spawn([{ task: 'Another window owns this' }], f.dir, undefined, undefined, true);
+    await assert.rejects(client.request('attach', connected), /belongs to a connected window/);
+    await client.request('attach', id);
+    await assert.rejects(client.request('start', 'Accidental new agent', f.dir), /already has/);
+    await assert.rejects(client.request('attach', id), /already has/);
+    assert.equal(f.children.history.records.size, 2);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('deleting an attached background agent closes the view without changing ordinary deletion semantics', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work to delete' }], f.dir);
+  const client = await connectWindow(f.dir, e => events.push(e), () => {});
+  try {
+    await client.request('attach', id);
+    await f.children.remove(id);
+    await until(() => events.some(e => e.name === 'finished'));
+    assert.match(events.find(e => e.name === 'finished')?.text ?? '', /deleted/);
+    assert.equal(f.children.history.records.has(id), false);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('SIGKILL of an attached terminal does not stop its existing background session', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work survives killed terminal' }], f.dir);
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import {createConnection} from 'node:net';
+    const socket = createConnection(process.argv[1]);
+    socket.on('connect', () => socket.write(JSON.stringify({kind:'request',id:1,action:'attach',text:process.argv[2]})+'\\n'));
+    socket.on('data', () => process.stdout.write('attached\\n'));
+  `, profileSocket(f.dir, 'windows'), id], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let attached = false; child.stdout.on('data', () => { attached = true; });
+  try {
+    await until(() => attached);
+    child.kill('SIGKILL');
+    await new Promise<void>(resolve => child.once('exit', () => resolve()));
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+    assert.ok(f.children.live(id));
+    assert.equal(f.children.history.records.get(id)?.handoff, undefined);
+    assert.equal(f.reports.length, 0);
+  } finally { child.kill('SIGKILL'); await close(); await f.close(); }
+});
+
+test('the normal Pi extension CLI attaches directly, persists the agent binding, routes input, and shutdown only detaches', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-cli-home-'));
+  createProfile('attach');
+  const close = await serveWindows(profilePath('attach'), f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work CLI existing session' }], f.dir);
+  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: 'off', retry: { enabled: false } });
+  const loader = new DefaultResourceLoader({ cwd: f.dir, agentDir: join(f.dir, 'client-agent'), settingsManager,
+    noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat] });
+  await loader.reload();
+  const { session } = await createAgentSession({ modelRuntime: f.runtime, model: f.registry.find('window-test', 'child'),
+    resourceLoader: loader, settingsManager, tools: [] });
+  const errors: string[] = [];
+  session.extensionRunner.setFlagValue('optchat-profile', 'attach');
+  session.extensionRunner.setFlagValue('optchat-agent', id);
+  const ui = { ...session.extensionRunner.getUIContext(), select: async () => { throw new Error('Direct attachment must not ask to spawn a connected agent'); } };
+  try {
+    await session.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => errors.push(error.error) });
+    assert.deepEqual(errors, []);
+    const binding = session.sessionManager.getEntries().findLast(e => e.type === 'custom' && e.customType === 'optchat.profile');
+    assert.ok(binding?.type === 'custom');
+    assert.deepEqual(binding.data, { name: 'attach', agentId: id });
+    assert.equal(f.children.history.records.size, 1);
+    await session.prompt('CLI guidance for the original agent.');
+    assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.text, 'CLI guidance for the original agent.');
+    assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.from, 'user');
+    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+    assert.equal(f.children.history.records.get(id)?.handoff, undefined);
+    // A resumed client session reconnects to the same ID, not a new connected-window conversation.
+    const resumedLoader = new DefaultResourceLoader({ cwd: f.dir, agentDir: join(f.dir, 'client-agent'), settingsManager,
+      noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat] });
+    await resumedLoader.reload();
+    const { session: resumed } = await createAgentSession({ modelRuntime: f.runtime, model: f.registry.find('window-test', 'child'),
+      resourceLoader: resumedLoader, settingsManager, sessionManager: session.sessionManager, tools: [] });
+    const resumedErrors: string[] = [];
+    try {
+      await resumed.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => resumedErrors.push(error.error) });
+      assert.deepEqual(resumedErrors, []);
+      assert.equal(f.children.history.records.size, 1);
+      await resumed.prompt('After client resume.');
+      assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.text, 'After client resume.');
+      assert.equal(f.children.history.records.get(id)?.handoff, undefined);
+    } finally { await resumed.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); resumed.dispose(); }
+  } finally {
+    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose();
+    await close(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+test('a large finished transcript replays in bounded batches before the attached view ends', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'Large historical background task' }], f.dir);
+  await until(() => !f.children.live(id));
+  const originalMessages = f.children.messages.bind(f.children);
+  const messages = originalMessages(id);
+  for (let i = 0; i < 150; i++) messages.push({ role: 'toolResult', toolCallId: `history-${i}`, toolName: 'bash',
+    content: [{ type: 'text', text: `${i}: ${'x'.repeat(40_000)}` }], isError: false, timestamp: i });
+  f.children.messages = run => run === id ? messages : originalMessages(run);
+  let disconnected = false;
+  const client = await connectWindow(f.dir, e => events.push(e), () => { disconnected = true; });
+  try {
+    await client.request('attach', id);
+    await until(() => events.some(e => e.name === 'finished'));
+    assert.equal(disconnected, false, 'more than 4 MB of history must not overflow the socket');
+    assert.equal(events.filter(e => e.message?.role === 'toolResult').length, 150);
+    assert.equal(events.at(-1)?.name, 'finished', 'finish follows the entire replay, not only the first batch');
+    assert.equal(f.children.history.records.get(id)?.state, 'completed');
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('the owner lists only live, unopened background agents and frees a terminal claim on detach', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [one, two] = await f.children.spawn([{ task: 'hold work one' }, { task: 'hold work two' }], f.dir);
+  const [done] = await f.children.spawn([{ task: 'Finished history is not a menu option' }], f.dir);
+  const [connected] = await f.children.spawn([{ task: 'Owned connected conversation' }], f.dir, undefined, undefined, true);
+  await until(() => !f.children.live(done));
+  const calls = f.requests.length;
+  const client = await connectWindow(f.dir, () => {}, () => {});
+  try {
+    const initial = await listAttachableAgents(f.dir);
+    assert.deepEqual(new Set(initial.map(a => a.id)), new Set([one, two]));
+    assert.ok(initial.every(a => a.task.startsWith('hold work') && a.state === 'running'));
+    await client.request('attach', one);
+    assert.deepEqual((await listAttachableAgents(f.dir)).map(a => a.id), [two]);
+    await client.request('complete');
+    assert.deepEqual(new Set((await listAttachableAgents(f.dir)).map(a => a.id)), new Set([one, two]));
+    assert.equal(f.requests.length, calls, 'listing and selecting must not call a model');
+    assert.equal(f.children.history.records.size, 4);
+    assert.equal(f.children.history.records.get(connected)?.connected, true);
+    assert.equal(f.children.history.records.get(one)?.state, 'running');
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('an agent open in the main inspector is excluded and protected until that view closes', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work main inspector' }], f.dir);
+  const client = await connectWindow(f.dir, () => {}, () => {});
+  const { promise: dismissed, resolve: dismiss } = Promise.withResolvers<void>();
+  const ctx = { ui: { custom: async () => { await dismissed; } } } as unknown as ExtensionContext;
+  const view = showAgentView(ctx, { id, children: f.children });
+  try {
+    assert.equal(f.children.isViewed(id), true);
+    assert.deepEqual(await listAttachableAgents(f.dir), []);
+    await assert.rejects(client.request('attach', id), /already open in another window/);
+    dismiss(); await view;
+    assert.equal(f.children.isViewed(id), false);
+    await client.request('attach', id);
+    await assert.rejects(showAgentView(ctx, { id, children: f.children }), /already open in another window/);
+    await client.request('complete');
+    assert.equal(f.children.isViewed(id), false);
+  } finally { dismiss(); await view; client.close(); await close(); await f.close(); }
+});
+
+test('two simultaneous terminal claims have exactly one winner and a stale menu never spawns another agent', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work exclusive attachment' }], f.dir);
+  const clients = await Promise.all([connectWindow(f.dir, () => {}, () => {}), connectWindow(f.dir, () => {}, () => {})]);
+  try {
+    assert.equal((await listAttachableAgents(f.dir))[0]?.id, id);
+    const results = await Promise.allSettled(clients.map(c => c.request('attach', id)));
+    assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+    const loser = results.find(r => r.status === 'rejected');
+    assert.ok(loser?.status === 'rejected'); assert.match(String(loser.reason), /already open/);
+    assert.equal(f.children.history.records.size, 1);
+    assert.deepEqual(await listAttachableAgents(f.dir), []);
+    const winnerIndex = results.findIndex(r => r.status === 'fulfilled');
+    clients[winnerIndex].close();
+    await until(() => !f.children.isViewed(id));
+    await clients[1 - winnerIndex].request('attach', id);
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+  } finally { clients.forEach(c => c.close()); await close(); await f.close(); }
+});
+
+test('main view cleanup releases the claim even when the overlay fails', async () => {
+  const f = await fixture();
+  const [id] = await f.children.spawn([{ task: 'hold work overlay failure' }], f.dir);
+  const ctx = { ui: { custom: async () => { throw new Error('Overlay failed'); } } } as unknown as ExtensionContext;
+  try {
+    await assert.rejects(showAgentView(ctx, { id, children: f.children }), /Overlay failed/);
+    assert.equal(f.children.isViewed(id), false);
+    const release = f.children.claimView(id); release();
+    const other = f.children.claimView(id); release();
+    assert.equal(f.children.isViewed(id), true, 'an old release cannot drop a newer view');
+    other(); assert.equal(f.children.isViewed(id), false);
+  } finally { await f.close(); }
+});
+
+async function menuClient(f: Awaited<ReturnType<typeof fixture>>, name: string,
+  select: (title: string, options: string[]) => Promise<string | undefined>) {
+  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: 'off', retry: { enabled: false } });
+  const loader = new DefaultResourceLoader({ cwd: f.dir, agentDir: join(f.dir, 'menu-client'), settingsManager,
+    noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat] });
+  await loader.reload();
+  const { session } = await createAgentSession({ modelRuntime: f.runtime, model: f.registry.find('window-test', 'child'),
+    resourceLoader: loader, settingsManager, tools: [] });
+  const errors: string[] = [];
+  session.extensionRunner.setFlagValue('optchat-profile', name);
+  const ui = { ...session.extensionRunner.getUIContext(), select,
+    notify: (text: string, type?: string) => { if (type === 'error') errors.push(text); } };
+  await session.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => errors.push(error.error) });
+  return { session, errors, async close() { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); } };
+}
+
+test('the busy-profile menu offers unopened subagents below Connect and selecting one opens that same session', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-home-'));
+  createProfile('menu');
+  const unlock = await lockProfile(profilePath('menu'), 'Main window');
+  const close = await serveWindows(profilePath('menu'), f.children, () => true, async () => {});
+  const [available, occupied] = await f.children.spawn([{ task: 'hold work available' }, { task: 'hold work occupied' }], f.dir);
+  const releaseOccupied = f.children.claimView(occupied);
+  let choices: string[] = [];
+  const client = await menuClient(f, 'menu', async (title, options) => {
+    assert.match(title, /menu is open in another window/); choices = options;
+    return options.find(option => option.startsWith(`Open subagent ${available}`));
+  });
+  try {
+    assert.deepEqual(client.errors, []);
+    assert.equal(choices[0], 'Start a connected subagent conversation here');
+    assert.match(choices[1], new RegExp(`^Open subagent ${available}.*hold work available`));
+    assert.equal(choices.at(-1), 'Back');
+    assert.ok(!choices.some(c => c.includes(occupied)));
+    const binding = client.session.sessionManager.getEntries().findLast(e => e.type === 'custom' && e.customType === 'optchat.profile');
+    assert.ok(binding?.type === 'custom'); assert.deepEqual(binding.data, { name: 'menu', agentId: available });
+    await client.session.prompt('Guidance via the menu-selected existing agent.');
+    assert.equal(f.children.history.records.get(available)?.guidance.at(-1)?.text, 'Guidance via the menu-selected existing agent.');
+    assert.equal(f.children.history.records.size, 2);
+    assert.equal(f.children.isViewed(available), true);
+    await client.close();
+    await until(() => !f.children.isViewed(available));
+    assert.equal(f.children.history.records.get(available)?.state, 'running');
+  } finally {
+    await client.close(); releaseOccupied(); await close(); await unlock(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+test('a menu selection claimed while the menu is open is refused and the menu refreshes without spawning', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-race-'));
+  createProfile('menu');
+  const unlock = await lockProfile(profilePath('menu'), 'Main window');
+  const close = await serveWindows(profilePath('menu'), f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work menu race' }], f.dir);
+  let release = () => {}, menus = 0;
+  const client = await menuClient(f, 'menu', async (title, options) => {
+    menus++;
+    if (menus === 1) { const selection = options.find(o => o.startsWith(`Open subagent ${id}`)); assert.ok(selection); release = f.children.claimView(id); return selection; }
+    assert.ok(!options.some(o => o.includes(id)), 'refresh removes the now-open agent');
+    assert.match(title, /No unopened background agents are running/);
+    return undefined;
+  });
+  try {
+    assert.equal(menus, 2);
+    assert.ok(client.errors.some(e => /already open/.test(e)));
+    assert.equal(f.children.history.records.size, 1);
+    assert.equal(f.children.history.records.get(id)?.state, 'running');
+    assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
+  } finally {
+    await client.close(); release(); await close(); await unlock(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
