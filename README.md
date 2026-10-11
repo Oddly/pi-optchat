@@ -186,7 +186,7 @@ pi --optchat-profile work
 
 First configure an accessible subagent model in the main window with `/optchat agents model` and ask the main agent to start a background task. Typing in **Start a connected subagent conversation here** instead creates a conversation owned by that terminal, so it is not an unopened background agent. If no eligible background agent exists, the menu explains this rather than adding an agent row.
 
-When the profile is already open, the menu offers **Start a connected subagent conversation here**, followed by **Open subagent <id> · <state> · <task>** for each available background agent. Only live running, waiting or paused agents with no conversation view open are listed. An agent open in the main inspector or another terminal is omitted. Selecting it opens that existing session, not a new subagent. If another window opens it while the menu is on screen, the selection is refused and the menu refreshes.
+When the profile is already open, the menu offers **Start a connected subagent conversation here**, followed by **Open subagent <id> · <state> · <task>** for each available background agent. Only live running, waiting or paused agents with no conversation view open are listed. An agent open in the main inspector or another terminal is omitted. Selecting it opens that existing session, not a new subagent. If another window opens it or it finishes while the menu is on screen, the selection is refused and the menu refreshes. If the owner does not answer the listing within two seconds, the menu falls back to the connected-conversation and Back options.
 
 You can also skip the menu with the exact ID shown in the main window's **Agents** inspector or subagent report:
 
@@ -197,12 +197,12 @@ pi --optchat-profile work --optchat-agent 8ab62e89
 This opens that **same agent's existing session** as a normal Pi chat in the second terminal: its task, previous replies and tool results, followed by live output. Messages you type are direct user guidance to that agent, not tasks for a new subagent. A paused agent continues when you send a message. `/tell-main` still contacts the main agent.
 
 - The original Pi process must stay open and support this option too. It remains the only profile writer and execution host; attaching is not a detached worker or a second copy of the session.
-- Each agent can have one conversation view open at a time (main inspector or attached terminal). Close that view before opening it elsewhere. Merely selecting an agent in the inspector list does not claim it.
+- Each agent can have one conversation view open at a time (main inspector or attached terminal). Close that view before opening it elsewhere. A finished attached view releases its claim even if the terminal stays open. Merely selecting an agent in the inspector list does not claim it.
 - No new agent, model call, or agent slot is created merely by opening the window. Reports still go to the agent's original parent.
 - **Closing, force-quitting, or `/complete` only detaches this window. It does not stop the background agent or prepare a new handoff.** Stop or interrupt the agent from the original window's Agents inspector.
 - A finished agent opens for reading without being restarted. Ask its original parent to resume it before attaching for more work.
 - This requires interactive Pi, a profile, and an exact background-agent ID. An unknown ID, missing owner, or connected-window-owned conversation is refused rather than creating a new conversation.
-- The local Pi session saves its profile and agent binding: `pi --resume` reconnects that window to the same agent while the owner is open. The agent ID itself is **not** a Pi session ID; do not use `pi --session 8ab62e89`.
+- The local Pi session saves its profile and agent binding: `pi --resume` reconnects that window to the same agent while the owner is open, without replaying transcript entries already saved in that Pi session. The agent ID itself is **not** a Pi session ID; do not use `pi --session 8ab62e89`.
 
 The original window still manages agents, settings and memory. This option opens an existing chat directly; it does not enable `/optchat agents` in connected windows.
 

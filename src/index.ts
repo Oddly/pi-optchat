@@ -291,7 +291,7 @@ export default function optchat(pi: ExtensionAPI) {
           const agentId = choice && labels.get(choice);
           if (agentId) {
             try {
-              remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId);
+              remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId, true);
               fault = undefined; pi.appendEntry(binding, { name, agentId });
               // Keep the specific agent binding instead of overwriting it below with just the profile.
               for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();

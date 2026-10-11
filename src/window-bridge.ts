@@ -8,7 +8,7 @@ import { textContent } from './transcript.ts';
 import { isActiveRun } from './runs.ts';
 
 type Action = 'list-agents' | 'attach' | 'start' | 'say' | 'tell-main' | 'answer' | 'complete';
-interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string }
+interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string; cursor?: number; activeOnly?: boolean }
 interface Reply { kind: 'reply'; id: number; error?: string; text?: string }
 /** A tool the subagent is running right now, with its streamed output so far. */
 export interface LiveTool { id: string; name: string; args: unknown; output?: unknown; started: number }
@@ -20,7 +20,7 @@ export interface LiveState { state: string; model: string; streaming?: AgentMess
  */
 export interface WindowEvent {
   kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string; from?: 'user' | 'agent';
-  message?: AgentMessage; live?: LiveState;
+  message?: AgentMessage; live?: LiveState; cursor?: number;
 }
 type Frame = Request | Reply | WindowEvent;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -34,13 +34,16 @@ function parse(value: unknown): Frame {
   const name = value.name, action = value.action, from = value.from;
   if (value.kind === 'event' && (name === 'started' || name === 'message' || name === 'status' || name === 'finished') && typeof value.text === 'string')
     return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined,
-      message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined };
+      message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined,
+      cursor: Number.isSafeInteger(value.cursor) && (value.cursor as number) >= 0 ? value.cursor as number : undefined };
   if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) throw new Error('Invalid request ID');
   if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string') && (value.text === undefined || typeof value.text === 'string'))
     return { kind: 'reply', id: value.id, error: value.error, text: value.text };
   if (value.kind === 'request' && (action === 'list-agents' || action === 'attach' || action === 'start' || action === 'say' || action === 'tell-main' || action === 'answer' || action === 'complete')
-    && (value.text === undefined || typeof value.text === 'string') && (value.cwd === undefined || typeof value.cwd === 'string'))
-    return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd };
+    && (value.text === undefined || typeof value.text === 'string') && (value.cwd === undefined || typeof value.cwd === 'string')
+    && (value.cursor === undefined || Number.isSafeInteger(value.cursor) && (value.cursor as number) >= 0)
+    && (value.activeOnly === undefined || typeof value.activeOnly === 'boolean'))
+    return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd, cursor: value.cursor as number | undefined, activeOnly: value.activeOnly as boolean | undefined };
   throw new Error('Invalid window message');
 }
 const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
@@ -120,13 +123,20 @@ export async function serveWindows(directory: string, children: Children, availa
             const info = children.history.records.get(id);
             if (!info) throw new Error(`No subagent ${id} in this profile`);
             if (info.connected) throw new Error(`${id} already belongs to a connected window; attach to a background subagent instead`);
+            if (frame.activeOnly && (!children.live(id) || !['running', 'waiting', 'paused'].includes(info.state)))
+              throw new Error(`Subagent ${id} is no longer available in the menu. Refresh and choose a live agent.`);
+            const live = children.live(id);
+            const messages = live?.session.messages ?? children.messages(id);
+            cursor = frame.cursor ?? 0;
+            if (cursor > messages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'toolResult').length)
+              throw new Error('Saved replay position is beyond this agent transcript; open it in a fresh Pi session.');
+            firstUser = cursor === 0; said.add(info.task.trim());
             // This socket borrows the existing session, never its lifetime, slot or report destination.
             releaseView = children.claimView(id);
-            attached = true; child = id;
+            attached = true; child = id; finalMessages = live ? undefined : messages;
             for (const guidance of info.guidance) if (guidance.from === 'user') said.add(guidance.text.trim());
             send({ kind: 'event', name: 'started', text: child });
-            const live = children.live(child);
-            drainMessages(live?.session.messages ?? (finalMessages = children.messages(child)), info.task);
+            drainMessages(messages, info.task);
           } else if (frame.action === 'start') {
             if (child) throw new Error('This window already has a conversation');
             if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
@@ -171,10 +181,10 @@ export async function serveWindows(directory: string, children: Children, availa
         const message = displayable[cursor++];
         let text = message.role === 'toolResult' ? '' : textContent(message.content);
         if (message.role === 'user' && firstUser) { text = task; firstUser = false; said.add(task.trim()); }
-        if (message.role === 'user') { if (text) send({ kind: 'event', name: 'message', from: said.has(text.trim()) ? 'user' : undefined, text: shorten(text, 200_000) }); continue; }
+        if (message.role === 'user') { if (text) send({ kind: 'event', name: 'message', from: said.has(text.trim()) ? 'user' : undefined, text: shorten(text, 200_000), cursor }); continue; }
         const clipped = clip(message);
-        if (fits(clipped)) send({ kind: 'event', name: 'message', from: message.role === 'assistant' ? 'agent' : undefined, text: shorten(text, 200_000), message: clipped });
-        else if (text) send({ kind: 'event', name: 'message', from: 'agent', text: shorten(text, 200_000) });
+        if (fits(clipped)) send({ kind: 'event', name: 'message', from: message.role === 'assistant' ? 'agent' : undefined, text: shorten(text, 200_000), message: clipped, cursor });
+        else if (text) send({ kind: 'event', name: 'message', from: 'agent', text: shorten(text, 200_000), cursor });
       }
       return true;
     };
@@ -184,6 +194,7 @@ export async function serveWindows(directory: string, children: Children, availa
       if (!info) {
         // Deleted from the Agents page: end the window (and a headless join) instead of leaving it waiting forever.
         ending = true;
+        releaseView?.(); releaseView = undefined;
         send({ kind: 'event', name: 'finished', text: 'This conversation was deleted from the Agents page.' });
         return;
       }
@@ -202,6 +213,7 @@ export async function serveWindows(directory: string, children: Children, availa
         try { if (!drainMessages(finalMessages ??= children.messages(child), info.task)) return; }
         catch (error) { send({ kind: 'event', name: 'message', text: `Could not read the final transcript: ${errorText(error)}` }); }
         ending = true;
+        releaseView?.(); releaseView = undefined;
         send({ kind: 'event', name: 'finished', text: attached ? `Agent ${child} is ${info.state}. Its report goes to its original parent; /complete closes only this view.` : info.handoff?.text ?? 'Conversation ended.' });
       }
     }, 150);
@@ -228,7 +240,7 @@ export async function serveWindows(directory: string, children: Children, availa
   };
 }
 
-export async function connectWindow(directory: string, event: (event: WindowEvent) => void, disconnected: () => void) {
+export async function connectWindow(directory: string, event: (event: WindowEvent) => void, disconnected: () => void, connectTimeout = 5000) {
   const socket = createConnection(profileSocket(directory, 'windows'));
   let next = 0;
   const pending = new Map<number, { resolve: (text?: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
@@ -245,17 +257,17 @@ export async function connectWindow(directory: string, event: (event: WindowEven
   });
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', resolve); socket.once('error', reject);
-    socket.setTimeout(5000, () => socket.destroy(new Error('Profile owner did not respond')));
+    socket.setTimeout(connectTimeout, () => socket.destroy(new Error('Profile owner did not respond')));
   });
   socket.setTimeout(0);
   return {
-    async request(action: Action, text?: string, cwd?: string) {
+    async request(action: Action, text?: string, cwd?: string, options: { timeout?: number; cursor?: number; activeOnly?: boolean } = {}) {
       if (socket.destroyed) throw new Error('The original Pi window is disconnected');
       if (text && text.length > 256_000) throw new Error('Connected-window messages are limited to 256,000 characters');
       const id = next++;
       return await new Promise<string | undefined>((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); reject(new Error('Owner response timed out; closing this connection')); socket.destroy(); }, 120_000);
-        pending.set(id, { resolve, reject, timer }); send({ kind: 'request', id, action, text, cwd });
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error('Owner response timed out; closing this connection')); socket.destroy(); }, options.timeout ?? 120_000);
+        pending.set(id, { resolve, reject, timer }); send({ kind: 'request', id, action, text, cwd, cursor: options.cursor, activeOnly: options.activeOnly });
       });
     },
     close() { socket.destroy(); },
@@ -264,10 +276,11 @@ export async function connectWindow(directory: string, event: (event: WindowEven
 
 export interface AttachableAgent { id: string; task: string; state: string }
 /** Query the owner, not run metadata on disk: it knows which main/terminal views are actually open. */
-export async function listAttachableAgents(directory: string): Promise<AttachableAgent[]> {
-  const connection = await connectWindow(directory, () => {}, () => {});
+export async function listAttachableAgents(directory: string, timeout = 2000): Promise<AttachableAgent[]> {
+  const deadline = Date.now() + timeout;
+  const connection = await connectWindow(directory, () => {}, () => {}, timeout);
   try {
-    const agents: unknown = JSON.parse(await connection.request('list-agents') ?? '[]');
+    const agents: unknown = JSON.parse(await connection.request('list-agents', undefined, undefined, { timeout: Math.max(1, deadline - Date.now()) }) ?? '[]');
     if (!Array.isArray(agents) || !agents.every(agent => record(agent) && typeof agent.id === 'string'
       && typeof agent.task === 'string' && (agent.state === 'running' || agent.state === 'waiting' || agent.state === 'paused')))
       throw new Error('Invalid background agent list from the profile owner');

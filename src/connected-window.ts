@@ -1,6 +1,7 @@
 import { getMarkdownTheme, UserMessageComponent, type ExtensionAPI, type ExtensionContext, type Theme } from '@earendil-works/pi-coding-agent';
 import { Container, Loader, Markdown, type Component, type TUI } from '@earendil-works/pi-tui';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import { record } from './cache.ts';
 import { connectWindow, type LiveState, type WindowEvent } from './window-bridge.ts';
 import { profilePath } from './profiles.ts';
 import { TranscriptView } from './agent-view.ts';
@@ -8,7 +9,7 @@ import { isReport, reportBox } from './report-message.ts';
 import { statusState, windowTitle, type WindowState } from './title.ts';
 
 /** `turn` is one finished reply of the agent with the results of its tool calls, drawn like Pi draws its own turns. */
-type Details = { from?: WindowEvent['from']; turn?: AgentMessage[] };
+type Details = { from?: WindowEvent['from']; turn?: AgentMessage[]; agentId?: string; cursor?: number };
 
 /**
  * One transcript for the window, shared by the chat and the live widget, so tool calls keep their timings when they settle into the chat.
@@ -75,19 +76,26 @@ class LiveTurn implements Component {
   dispose() { clearInterval(this.timer); this.loader.stop(); }
 }
 
-export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title), agentId?: string) {
+export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title), agentId?: string, activeOnly = false) {
   // Each window draws with its own transcript, so nothing from an earlier window carries over.
   transcript = undefined;
+  // Store the replay cursor with each displayed entry, not ahead of an unfinished tool turn.
+  // Resuming a Pi session then replays only messages not already committed to that session.
+  const saved = agentId && ctx.sessionManager?.getEntries().findLast(entry => entry.type === 'custom_message'
+    && entry.customType === 'optchat-connected' && record(entry.details) && entry.details.agentId === agentId
+    && Number.isSafeInteger(entry.details.cursor) && (entry.details.cursor as number) >= 0);
+  const cursor = saved && saved.type === 'custom_message' ? (saved.details as Details).cursor ?? 0 : 0;
+  let turnCursor: number | undefined;
   let started = false, ended = false, liveTurn: LiveTurn | undefined, live: LiveState | undefined, turn: AgentMessage[] = [];
   const title = (state: WindowState) => setTitle(windowTitle(profile, state));
-  const display = (text: string, details: Details = {}) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details }, { triggerTurn: false });
+  const display = (text: string, details: Details = {}) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details: { ...details, agentId } }, { triggerTurn: false });
   const refresh = () => { if (liveTurn) { liveTurn.turn = turn; liveTurn.live = live; liveTurn.update(); } };
   /** A reply moves into the chat once all its tool calls have results, as Pi's own chat does when a tool finishes. */
   const commit = () => {
     if (!turn.length) return;
     const [reply] = turn;
-    display(reply.role === 'assistant' ? reply.content.flatMap(p => p.type === 'text' ? [p.text] : []).join('\n') : '', { from: 'agent', turn });
-    turn = [];
+    display(reply.role === 'assistant' ? reply.content.flatMap(p => p.type === 'text' ? [p.text] : []).join('\n') : '', { from: 'agent', turn, cursor: turnCursor });
+    turn = []; turnCursor = undefined;
   };
   const settled = () => { const done = new Set(turn.flatMap(m => m.role === 'toolResult' ? [m.toolCallId] : [])); return turn.length > 0 && toolCalls(turn[0]).every(id => done.has(id)); };
   const showLive = () => ctx.ui.setWidget('optchat-connected', (tui, theme) => { view(tui); liveTurn = new LiveTurn(tui, theme); refresh(); return liveTurn; });
@@ -101,15 +109,15 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
       // The tab says working exactly when the spinner spins.
       if (!ended && live) title(statusState(live.state, live.agents));
     } else if (event.message?.role === 'assistant') {
-      commit(); turn = [event.message];
+      commit(); turn = [event.message]; turnCursor = event.cursor;
       if (settled()) commit();
       refresh();
     } else if (event.message?.role === 'toolResult') {
-      if (turn.length) { turn.push(event.message); if (settled()) commit(); }
+      if (turn.length) { turn.push(event.message); turnCursor = event.cursor; if (settled()) commit(); }
       refresh();
     } else {
       commit();
-      display(event.text, { from: event.from });
+      display(event.text, { from: event.from, cursor: event.cursor });
       if (event.name === 'finished') {
         ended = true; hideLive(); title('done');
         ctx.ui.setStatus('optchat', `OptChat: ${profile} · conversation ended · /complete to exit`);
@@ -127,9 +135,14 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
       ? new Error('No running OptChat session on this profile. Start the original Pi window before attaching.') : error;
   });
   if (agentId) {
-    display(`Opening existing agent ${agentId}. Messages go to that same agent; /tell-main contacts the main agent. /complete or closing this window only detaches. The original Pi window must remain open.`);
-    try { await connection.request('attach', agentId); }
-    catch (error) { ended = true; connection.close(); hideLive(); throw error; }
+    if (!cursor) display(`Opening existing agent ${agentId}. Messages go to that same agent; /tell-main contacts the main agent. /complete or closing this window only detaches. The original Pi window must remain open.`);
+    try { await connection.request('attach', agentId, undefined, { cursor, activeOnly }); }
+    catch (error) {
+      ended = true; connection.close(); hideLive();
+      if (!started && error instanceof Error && error.message === 'Connection to the original Pi window was lost')
+        throw new Error('The original Pi window closed the connection before attachment. It may run an OptChat version that cannot open existing agents. Update OptChat and restart that window.');
+      throw error;
+    }
   } else {
     ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected window · send a task to start`); title('waiting');
     display(`Connected to ${profile}'s original window. Messages here go to one subagent using the profile's subagent model. /tell-main sends a message to the main agent; /complete ends this conversation and sends a handoff. Closing this window interrupts it.`);

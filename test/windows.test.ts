@@ -4,8 +4,10 @@ import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createServer, type Socket } from 'node:net';
 import { createAgentSession, DefaultResourceLoader, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
 import { TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { showAgentView } from '../src/agent-view.ts';
 import optchat from '../src/index.ts';
@@ -634,6 +636,13 @@ test('attachment replays real tool results and follows a paused background agent
     assert.ok(f.reports.some(t => t.includes(`[${id}]`) && t.includes('finish the original task')));
     assert.ok(events.some(e => e.from === 'agent' && e.text.includes('finish the original task')));
     assert.equal(f.summaries.length, 0);
+    assert.equal(f.children.isViewed(id), false, 'finished frees the claim while this socket stays open');
+    const releaseInspector = f.children.claimView(id);
+    releaseInspector();
+    await f.children.tell(id, 'hold work resumed by parent');
+    const second = await connectWindow(f.dir, () => {}, () => {});
+    try { await second.request('attach', id); assert.equal(f.children.isViewed(id), true); }
+    finally { second.close(); }
   } finally { client.close(); await close(); await f.close(); }
 });
 
@@ -740,6 +749,8 @@ test('the normal Pi extension CLI attaches directly, persists the agent binding,
     assert.ok(binding?.type === 'custom');
     assert.deepEqual(binding.data, { name: 'attach', agentId: id });
     assert.equal(f.children.history.records.size, 1);
+    const taskCopies = () => session.sessionManager.getEntries().filter(e => e.type === 'custom_message' && e.customType === 'optchat-connected' && e.content === 'hold work CLI existing session').length;
+    await until(() => taskCopies() === 1);
     await session.prompt('CLI guidance for the original agent.');
     assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.text, 'CLI guidance for the original agent.');
     assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.from, 'user');
@@ -758,6 +769,11 @@ test('the normal Pi extension CLI attaches directly, persists the agent binding,
       await resumed.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => resumedErrors.push(error.error) });
       assert.deepEqual(resumedErrors, []);
       assert.equal(f.children.history.records.size, 1);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      assert.equal(taskCopies(), 1, 'resuming does not persist the original task a second time');
+      const cursorEntries = resumed.sessionManager.getEntries().filter(e => e.type === 'custom_message' && e.customType === 'optchat-connected' && typeof (e.details as { cursor?: number })?.cursor === 'number');
+      const cursors = cursorEntries.map(e => (e as { details: { cursor: number } }).details.cursor);
+      assert.equal(new Set(cursors).size, cursors.length, 'replayed committed messages occur only once');
       await resumed.prompt('After client resume.');
       assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.text, 'After client resume.');
       assert.equal(f.children.history.records.get(id)?.handoff, undefined);
@@ -949,6 +965,175 @@ test('a menu selection claimed while the menu is open is refused and the menu re
     assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
   } finally {
     await client.close(); release(); await close(); await unlock(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+/** A real local socket with a deliberately old or unresponsive owner, never a provider/API call. */
+async function unresponsiveOwner(directory: string, dropRequests = false) {
+  const sockets = new Set<Socket>();
+  const server = createServer(socket => {
+    sockets.add(socket); socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    if (dropRequests) socket.on('data', () => socket.destroy());
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(profileSocket(directory, 'windows'), resolve); });
+  return async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  };
+}
+
+test('listing an unresponsive owner times out quickly and closes the listing socket', async () => {
+  const f = await fixture();
+  const close = await unresponsiveOwner(f.dir);
+  try {
+    const start = Date.now();
+    await assert.rejects(listAttachableAgents(f.dir, 100), /timed out/);
+    assert.ok(Date.now() - start < 2000, 'listing must not inherit the 120-second conversation timeout');
+  } finally { await close(); await f.close(); }
+});
+
+test('the busy-profile menu falls back to Connect/Back after a silent owner, within the two-second listing budget', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-silent-'));
+  createProfile('silent');
+  const unlock = await lockProfile(profilePath('silent'), 'Silent main window');
+  const close = await unresponsiveOwner(profilePath('silent'));
+  let menuTime = 0, options: string[] = [];
+  const start = Date.now();
+  const client = await menuClient(f, 'silent', async (_title, choices) => { menuTime = Date.now(); options = choices; return undefined; });
+  try {
+    assert.deepEqual(options, ['Start a connected subagent conversation here', 'Back']);
+    assert.ok(menuTime - start < 5000, 'startup must not wait 120 seconds for a listing');
+    assert.equal(f.children.history.records.size, 0);
+  } finally {
+    await client.close(); await close(); await unlock(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+test('attachment to an older owner that drops unknown requests gives an update/restart instruction', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-old-owner-'));
+  createProfile('old');
+  const close = await unresponsiveOwner(profilePath('old'), true);
+  const pi = { sendMessage() {} } as unknown as ExtensionAPI;
+  const ctx = { cwd: f.dir, ui: { setStatus() {}, setWidget() {}, notify() {}, setTitle() {} } } as unknown as ExtensionContext;
+  try {
+    await assert.rejects(openConnectedWindow(pi, ctx, 'old', undefined, 'existing-id'), /OptChat version.*Update OptChat and restart/);
+    assert.equal(f.children.history.records.size, 0);
+  } finally {
+    await close(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+test('a menu agent that finishes before selection is rejected and the menu refreshes without opening history', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-finished-'));
+  createProfile('menu');
+  const unlock = await lockProfile(profilePath('menu'), 'Main window');
+  const close = await serveWindows(profilePath('menu'), f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work finish during menu' }], f.dir);
+  let menus = 0;
+  const client = await menuClient(f, 'menu', async (_title, options) => {
+    if (++menus === 1) {
+      const selected = options.find(o => o.startsWith(`Open subagent ${id}`)); assert.ok(selected);
+      await f.children.interrupt(id); await f.children.tell(id, 'Finish before selection.');
+      await until(() => !f.children.live(id));
+      return selected;
+    }
+    assert.ok(!options.some(o => o.includes(id)));
+    return undefined;
+  });
+  try {
+    assert.equal(menus, 2);
+    assert.ok(client.errors.some(e => /no longer available in the menu/.test(e)));
+    assert.equal(f.children.isViewed(id), false);
+    assert.equal(f.children.history.records.size, 1);
+    assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
+  } finally {
+    await client.close(); await close(); await unlock(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
+});
+
+test('attachment resumes a saved replay cursor without replaying committed history, and rejects out-of-range cursors', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'Historical replay cursor task' }], f.dir);
+  await until(() => !f.children.live(id));
+  const events: WindowEvent[] = [];
+  const first = await connectWindow(f.dir, e => events.push(e), () => {});
+  try {
+    await first.request('attach', id);
+    await until(() => events.some(e => e.name === 'finished'));
+    const cursor = events.filter(e => e.name === 'message').at(-1)?.cursor;
+    assert.ok(cursor && cursor > 0);
+    const replay: WindowEvent[] = [];
+    const second = await connectWindow(f.dir, e => replay.push(e), () => {});
+    try {
+      await assert.rejects(second.request('attach', id, undefined, { cursor: cursor + 100 }), /beyond this agent transcript/);
+      assert.equal(f.children.isViewed(id), false);
+      await second.request('attach', id, undefined, { cursor });
+      await until(() => replay.some(e => e.name === 'finished'));
+      assert.equal(replay.filter(e => e.name === 'message').length, 0);
+    } finally { second.close(); }
+  } finally { first.close(); await close(); await f.close(); }
+});
+
+test('a resumed attached view keeps committed tool turns once and replays an uncommitted tool call with its new result', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-replay-turn-'));
+  createProfile('replay');
+  const close = await serveWindows(profilePath('replay'), f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'descendant-evidence-task' }], f.dir);
+  await until(() => !!f.children.live(id)?.streaming && f.children.live(id)!.session.messages.some(m => m.role === 'toolResult'));
+  await f.children.interrupt(id);
+  await until(() => f.children.history.records.get(id)?.state === 'paused');
+  type Entry = { type: 'custom_message'; customType: string; content: string; details?: { from?: string; turn?: AgentMessage[]; cursor?: number; agentId?: string } };
+  const entries: Entry[] = [];
+  const pi = { sendMessage: (message: Omit<Entry, 'type'>) => entries.push({ ...message, type: 'custom_message' }) } as unknown as ExtensionAPI;
+  const ctx = { cwd: f.dir, sessionManager: { getEntries: () => entries },
+    ui: { setStatus() {}, setWidget() {}, notify() {}, setTitle() {} } } as unknown as ExtensionContext;
+  let window: Awaited<ReturnType<typeof openConnectedWindow>> | undefined;
+  const committedEvidence = () => entries.filter(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'evidence')).length;
+  const committedPending = () => entries.filter(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'pending')).length;
+  try {
+    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
+    await until(() => committedEvidence() === 1);
+    const session = f.children.live(id)!.session;
+    const pending: AssistantMessage = { role: 'assistant', content: [{ type: 'toolCall', id: 'pending', name: 'bash', arguments: { command: 'echo new-result' } }],
+      api: 'openai-completions', model: 'child', provider: 'window-test', usage: emptyUsage(), stopReason: 'toolUse', timestamp: Date.now() };
+    // The existing view sees the call, but it is not a persisted turn until its result arrives.
+    session.messages.push(pending);
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.equal(entries.some(e => e.details?.turn?.includes(pending)), false);
+    window.close();
+    await until(() => !f.children.isViewed(id));
+    session.messages.push({ role: 'toolResult', toolCallId: 'pending', toolName: 'bash', content: [{ type: 'text', text: 'new-result' }], isError: false, timestamp: Date.now() });
+    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
+    await until(() => committedPending() === 1);
+    assert.equal(committedEvidence(), 1, 'previously committed tool calls/results are not added again');
+    const turn = entries.find(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'pending'))!.details!.turn!;
+    assert.equal(turn[0].role, 'assistant');
+    assert.ok(turn[0].role === 'assistant' && turn[0].content.some(p => p.type === 'toolCall' && p.id === 'pending'));
+    assert.equal(entries.filter(e => e.details?.from === 'user' && e.content === 'descendant-evidence-task').length, 1);
+    window.close(); await until(() => !f.children.isViewed(id));
+    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.equal(committedEvidence(), 1); assert.equal(committedPending(), 1, 'a second resume remains idempotent');
+  } finally {
+    window?.close(); await close(); await f.close();
     rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
     if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
   }
