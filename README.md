@@ -37,7 +37,7 @@ The footer shows the active profile. Memory follows the profile across directori
 
 For headless use (`pi -p`, `--mode rpc`, other extensions' runners), pass `--optchat-profile work`. Without it, and without a saved profile in a resumed session, a headless run is plain Pi with no OptChat memory. If the requested profile can't open (misspelled, deleted, or open in another Pi), the run reports the error and doesn't answer.
 
-If that profile is open in another Pi, `pi -p` joins it like a connected window: a subagent in that Pi answers, only its final reply goes to stdout, and the main agent gets the handoff. `--optchat-connect auto` (default) joins only when the profile is busy, `join` always joins (and fails if no Pi has the profile open), `off` reports the busy profile as an error. A failed join exits non-zero.
+If that profile is open in another Pi, `pi -p` joins it like a connected window: a subagent in that Pi answers, only its final reply goes to stdout, and the main agent gets the handoff. `--optchat-connect auto` (default) joins only when the profile is busy, `join` always joins (and fails if no Pi has the profile open), `off` reports the busy profile as an error. A failed join exits non-zero. A profile held by another `pi -p` (or JSON-mode) run can't be joined, since that run exits after its own prompt. Once it exits, `auto` opens the profile itself; `join` still fails, as no Pi has it open.
 
 ## Commands
 
@@ -98,7 +98,7 @@ Ask in plain words, for example: "Spawn an agent to investigate this repository 
 
 - Children get the profile's memory view (frozen at launch), its instructions, read-only `zoom`/`date`, and normal coding tools plus your installed extensions.
 - Children also get the Pi built-in extensions the main session loaded: MCP, codemode and tool search. Your MCP servers (`~/.pi/agent/mcp.json`, the project's `.pi/mcp.json`) work in subagents, with the sign-ins you made in Pi. If MCP is off in the main session (`--no-mcp`, `-builtin:mcp` in settings, or an extension that replaces `/mcp`), it is off in subagents too. Each subagent opens its own server connections (stdio servers start once per subagent) and closes them when it ends.
-- Each child reports to its parent as soon as it finishes, as one message starting `[id]`. A stopped or failed child reports its stop or error text. Turn **Group subagent reports** on to have the children of one spawn report together: when the last of them finishes, their reports reach the parent as one message, `[id] report` each, in spawn order. Each finished report is journaled right away, so if Pi dies before the rest finish, the reports it already has are delivered at the next start. Messages sent with `tell_parent`, connected windows and their handoffs are never held back, and a child resumed with `tell` reports on its own. The parent stays alive to receive reports; it never polls.
+- Each child reports to its parent as soon as it finishes, as one message starting `[id]`. A failed child reports its error text, and one whose request aborts with no stop (a provider abort) still reports `Task aborted: ...`. A stopped child's report says who stopped it (you, the agent that started it, or Pi closing while it was paused) and that `tell` resumes it, followed by its last message when it has one. Turn **Group subagent reports** on to have the children of one spawn report together: when the last of them finishes, their reports reach the parent as one message, `[id] report` each, in spawn order. Each finished report is journaled right away, so if Pi dies before the rest finish, the reports it already has are delivered at the next start. Messages sent with `tell_parent`, connected windows and their handoffs are never held back, and a child resumed with `tell` reports on its own. The parent stays alive to receive reports; it never polls.
 - In the main chat, subagent messages and reports appear in a dark grey box labelled `↳ subagent <id> · still running` or `· report`, so they don't look like something you typed. The model still receives them as ordinary user messages; memory logs them as kind `work` (older logs hold them as `user` messages starting `[id]`). (One exception: reports recovered at startup, before your first message in the session, still show as plain user messages.)
 - Every report ends with `Full chat: zoom("<id>")`, so the agent can check it against what the child actually did: `zoom` with a run ID returns that child's chat so far as `kind|text` lines (its task without the memory view, replies, tool calls, tool results cut to their first and last ~500 characters, and what it was told), in 25,000-character pages that say which `offset` to go on from. It works on running children too; a subagent can read only its own descendants' chats, as with `tell`. The report box leaves the trailer out.
 - While any subagent runs, each new input to the main agent (your message, a report, a `tell_parent` message, the restart note, a connected window's message) ends with one status line, `[OptChat status] Agents at work now: 8f28e694 "Review PR #123 carefully", …` (id and the first words of each task), so it knows what is still out without asking. It is rebuilt each time and never stored. It isn't repeated on the calls after a tool result within one turn, and nothing is sent while no agent runs. The main prompt says what the label means, so the model doesn't take it for the user. It comes after the cached view and turn, with the turn's cache mark on the block before it, so it costs no cache.
@@ -162,7 +162,7 @@ Pick the destination profile, then run `/optchat import`.
    - **Rebuild by conversation start date**: regenerate the whole tree, ordered by conversation start.
 4. **Preview**: destination, new and duplicate counts, text size, rough token estimate, and compactor. This is not a price quote: a big import costs about 3x that estimate in compactor input, because every message is summarized and then re-read in merges, each with the memory view as (mostly cached) context.
 
-**What gets imported**: user messages and final assistant replies, with original dates and source labels, as in Victor's recipe. Tool calls and results, intermediate commentary, reasoning, subagent transcripts, replayed context, and image/audio/file bytes are left out. So is the output Claude Code logs for slash and shell commands; the command itself stays as typed (`/name args` or `!command`). So are the context messages Codex injects, such as the AGENTS.md instructions and the environment context, and the messages OMP injects (reminders, background job notices). Pi / OMP keep `/skill:name args`, `!command` and `$code` as typed, without the skill's text or the output; `!!` and `$$` commands, kept from the model, stay out. Dropped text never becomes a conversation's title. ChatGPT alternate branches are labelled as alternatives, and so are Pi / OMP branches left by a rewind (`[alternate branch]`). Pi sessions that ran under OptChat are skipped: their messages are already in a profile's memory. A forked session adds only its new messages. Imported records are marked as historical so old requests are not treated as new instructions.
+**What gets imported**: user messages and final assistant replies, with original dates and source labels, as in Victor's recipe. Tool calls and results, intermediate commentary, reasoning, subagent transcripts, replayed context, and image/audio/file bytes are left out. So is the output Claude Code logs for slash and shell commands; the command itself stays as typed (`/name args` or `!command`). A message typed to Claude Code while it was working counts as a user message; Claude Code's `[Request interrupted by user]` markers and the replies they cut off are left out. So are the context messages Codex injects, such as the AGENTS.md instructions and the environment context, and the messages OMP injects (reminders, background job notices). Pi / OMP keep `/skill:name args`, `!command` and `$code` as typed, without the skill's text or the output; `!!` and `$$` commands, kept from the model, stay out. Dropped text never becomes a conversation's title. ChatGPT alternate branches are labelled as alternatives, and so are Pi / OMP branches left by a rewind (`[alternate branch]`). Pi sessions that ran under OptChat are skipped: their messages are already in a profile's memory. A forked session adds only its new messages. Imported records are marked as historical so old requests are not treated as new instructions.
 
 **Claude Code memories**: the auto-memory topic files in `~/.claude/projects/*/memory/` (not `MEMORY.md`, which only indexes them), picked by project. Each file becomes one dated note in the memory tree, not part of the prompt. An edited file comes in again as a newer note.
 
@@ -178,37 +178,22 @@ See OpenAI's guides on [exporting ChatGPT data](https://help.openai.com/en/artic
 
 ## Open an existing background agent in another terminal
 
-Open the same profile normally in the second terminal:
-
-```sh
-pi --optchat-profile work
-```
-
-First configure an accessible subagent model in the main window with `/optchat agents model` and ask the main agent to start a background task. Typing in **Start a connected subagent conversation here** instead creates a conversation owned by that terminal, so it is not an unopened background agent. If no eligible background agent exists, the menu explains this rather than adding an agent row.
-
-When the profile is already open, the menu offers **Start a connected subagent conversation here**, followed by **Open subagent <id> · <state> · <task>** for each available background agent. Only live running, waiting or paused agents with no conversation view open are listed. An agent open in the main inspector or another terminal is omitted. Selecting it opens that existing session, not a new subagent. If another window opens it or it finishes while the menu is on screen, the selection is refused and the menu refreshes. If the owner does not answer the listing within two seconds, the menu falls back to the connected-conversation and Back options.
-
-You can also skip the menu with the exact ID shown in the main window's **Agents** inspector or subagent report:
+When the profile is already open, `pi --optchat-profile work` in a second terminal offers **Start a connected subagent conversation here**, followed by **Open subagent <id> · <state> · <task>** for each running, waiting or paused background agent. You can also skip the menu with the ID shown in the main window's **Agents** page or a subagent report:
 
 ```sh
 pi --optchat-profile work --optchat-agent 8ab62e89
 ```
 
-This opens that **same agent's existing session** as a normal Pi chat in the second terminal: its task, previous replies and tool results, followed by live output. Messages you type are direct user guidance to that agent, not tasks for a new subagent. A paused agent continues when you send a message. `/tell-main` still contacts the main agent.
+This opens that **same agent's session** as a normal Pi chat: its task, previous replies and tool results, then live output. Messages you type are guidance to that agent; a paused agent continues when you send one. `/tell-main` still contacts the main agent.
 
-- The original Pi process must stay open and support this option too. It remains the only profile writer and execution host; attaching is not a detached worker or a second copy of the session.
-- Each agent can have one conversation view open at a time (main inspector or attached terminal). Close that view before opening it elsewhere. A finished attached view releases its claim even if the terminal stays open. Merely selecting an agent in the inspector list does not claim it.
-- No new agent, model call, or agent slot is created merely by opening the window. Reports still go to the agent's original parent.
-- **Closing, force-quitting, or `/complete` only detaches this window. It does not stop the background agent or prepare a new handoff.** Stop or interrupt the agent from the original window's Agents inspector.
-- A finished agent opens for reading without being restarted. Ask its original parent to resume it before attaching for more work.
-- This requires interactive Pi, a profile, and an exact background-agent ID. An unknown ID, missing owner, or connected-window-owned conversation is refused rather than creating a new conversation.
-- The local Pi session saves its profile and agent binding: `pi --resume` reconnects that window to the same agent while the owner is open, without replaying transcript entries already saved in that Pi session. The agent ID itself is **not** a Pi session ID; do not use `pi --session 8ab62e89`.
-
-The original window still manages agents, settings and memory. This option opens an existing chat directly; it does not enable `/optchat agents` in connected windows.
+- The original Pi window stays the only owner: it runs the agent, and reports still go to the agent's parent. Opening the window starts no new agent or model call.
+- **Closing the terminal or `/complete` only detaches.** The agent keeps running. Stop or interrupt it from the main window's **Agents** page, which can open the same agent at the same time, as can other terminals.
+- A finished agent opens for reading, without being restarted.
+- This needs interactive Pi and a running owner window. An unknown ID, or a conversation owned by another connected window, is refused rather than starting a new one. The attached terminal saves no session to resume; run the command again instead. The agent ID is not a Pi session ID.
 
 ## Connected windows
 
-Each profile is locked to one Pi process. If you open the same profile in a second terminal, Pi offers to connect it to the original window as a subagent, or to go back to the profile picker.
+Each profile is locked to one Pi process. If you open the same profile in a second terminal, Pi offers to connect it to the original window as a subagent, or to go back to the profile picker. Only an interactive or RPC Pi accepts connections; a headless `pi -p` run holding the profile does not.
 
 - Your first message starts a subagent in the second window's working directory. Later messages continue the same conversation.
 - The window looks like a normal Pi chat: replies, tool calls with their output and running time, the working spinner, and reports from the subagent's own agents in the dark box. Ctrl+O expands tool output.
@@ -217,6 +202,7 @@ Each profile is locked to one Pi process. If you open the same profile in a seco
 - Run `/complete` when done. The window closes, remaining work stops, and the compactor writes a handoff for the main agent: decisions, changes, evidence, failures, unfinished work, and links to the transcripts.
 - Closing or force-quitting the window also produces a handoff, marked **interrupted**.
 - If the original window is closed cleanly, handoffs are delivered on next start. If it is killed, reopening the profile recovers unfinished handoffs (work is not restarted).
+- Closing the original window, or running `/reload` in it, ends every connected conversation; Pi gives no chance to warn before a reload. The connected window then shows **disconnected**. `/new` there starts over: after the profile picker if Pi was started without `--optchat-profile`, a profile still open elsewhere offers **Start a connected subagent conversation here** again, and a free one opens in this window.
 - Text only. For images, give the agent a file path.
 - The connection is a local socket restricted to your OS user. No daemon or server.
 

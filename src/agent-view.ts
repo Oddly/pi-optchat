@@ -323,7 +323,6 @@ export function hideImagesUnderOverlays(tui: TUI) {
 
 /** Swaps the whole screen to the subagent's conversation; Pi restores the main chat on close. */
 export async function showAgentView(ctx: ExtensionContext, options: { id: string; children: Children; signal?: AbortSignal }) {
-  const release = options.children.claimView(options.id);
   let restore = () => {};
   try {
     return await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
@@ -333,5 +332,5 @@ export async function showAgentView(ctx: ExtensionContext, options: { id: string
         color: (tone, text) => theme.fg(tone, text), isExpandKey: data => keybindings.matches(data, 'app.tools.expand'),
       });
     }, { overlay: true, overlayOptions: { width: '100%', maxHeight: '100%', row: 0, col: 0 } });
-  } finally { restore(); release(); }
+  } finally { restore(); }
 }

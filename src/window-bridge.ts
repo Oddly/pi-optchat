@@ -8,7 +8,7 @@ import { textContent } from './transcript.ts';
 import { isActiveRun } from './runs.ts';
 
 type Action = 'list-agents' | 'attach' | 'start' | 'say' | 'tell-main' | 'answer' | 'complete';
-interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string; cursor?: number; activeOnly?: boolean }
+interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string; activeOnly?: boolean }
 interface Reply { kind: 'reply'; id: number; error?: string; text?: string }
 /** A tool the subagent is running right now, with its streamed output so far. */
 export interface LiveTool { id: string; name: string; args: unknown; output?: unknown; started: number }
@@ -20,7 +20,7 @@ export interface LiveState { state: string; model: string; streaming?: AgentMess
  */
 export interface WindowEvent {
   kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string; from?: 'user' | 'agent';
-  message?: AgentMessage; live?: LiveState; cursor?: number;
+  message?: AgentMessage; live?: LiveState;
 }
 type Frame = Request | Reply | WindowEvent;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -34,16 +34,14 @@ function parse(value: unknown): Frame {
   const name = value.name, action = value.action, from = value.from;
   if (value.kind === 'event' && (name === 'started' || name === 'message' || name === 'status' || name === 'finished') && typeof value.text === 'string')
     return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined,
-      message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined,
-      cursor: Number.isSafeInteger(value.cursor) && (value.cursor as number) >= 0 ? value.cursor as number : undefined };
+      message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined };
   if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) throw new Error('Invalid request ID');
   if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string') && (value.text === undefined || typeof value.text === 'string'))
     return { kind: 'reply', id: value.id, error: value.error, text: value.text };
   if (value.kind === 'request' && (action === 'list-agents' || action === 'attach' || action === 'start' || action === 'say' || action === 'tell-main' || action === 'answer' || action === 'complete')
     && (value.text === undefined || typeof value.text === 'string') && (value.cwd === undefined || typeof value.cwd === 'string')
-    && (value.cursor === undefined || Number.isSafeInteger(value.cursor) && (value.cursor as number) >= 0)
     && (value.activeOnly === undefined || typeof value.activeOnly === 'boolean'))
-    return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd, cursor: value.cursor as number | undefined, activeOnly: value.activeOnly as boolean | undefined };
+    return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd, activeOnly: value.activeOnly as boolean | undefined };
   throw new Error('Invalid window message');
 }
 const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
@@ -99,7 +97,6 @@ export async function serveWindows(directory: string, children: Children, availa
     connections.add(socket);
     let child: string | undefined, attached = false, cursor = 0, firstUser = true, lastStatus = '', ending = false;
     let finalMessages: AgentMessage[] | undefined;
-    let releaseView: (() => void) | undefined;
     const said = new Set<string>(); // Main-agent guidance and child reports reach the session as user messages too.
     const controller = new AbortController();
     let queue = Promise.resolve();
@@ -111,7 +108,7 @@ export async function serveWindows(directory: string, children: Children, availa
           if (socket.destroyed || ending) throw new Error('Conversation is closing');
           if (frame.action === 'list-agents') {
             const agents: AttachableAgent[] = available() ? children.history.list()
-              .filter(info => !info.connected && !!children.live(info.id) && !children.isViewed(info.id)
+              .filter(info => !info.connected && !!children.live(info.id)
                 && (info.state === 'running' || info.state === 'waiting' || info.state === 'paused'))
               .map(info => ({ id: info.id, task: info.task.slice(0, 200), state: info.state })) : [];
             send({ kind: 'reply', id: frame.id, text: JSON.stringify(agents) }); return;
@@ -127,12 +124,9 @@ export async function serveWindows(directory: string, children: Children, availa
               throw new Error(`Subagent ${id} is no longer available in the menu. Refresh and choose a live agent.`);
             const live = children.live(id);
             const messages = live?.session.messages ?? children.messages(id);
-            cursor = frame.cursor ?? 0;
-            if (cursor > messages.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'toolResult').length)
-              throw new Error('Saved replay position is beyond this agent transcript; open it in a fresh Pi session.');
-            firstUser = cursor === 0; said.add(info.task.trim());
+            said.add(info.task.trim());
             // This socket borrows the existing session, never its lifetime, slot or report destination.
-            releaseView = children.claimView(id);
+            // Other views (the main window's Agents page, other terminals) stay open alongside it.
             attached = true; child = id; finalMessages = live ? undefined : messages;
             for (const guidance of info.guidance) if (guidance.from === 'user') said.add(guidance.text.trim());
             send({ kind: 'event', name: 'started', text: child });
@@ -157,7 +151,6 @@ export async function serveWindows(directory: string, children: Children, availa
               if (live) drainMessages(live.session.messages, live.info.task);
               ending = true;
               if (!attached) track(children.finish(child, 'complete').then(() => {}));
-              else { releaseView?.(); releaseView = undefined; }
               send({ kind: 'event', name: 'finished', text: attached ? 'Detached. The background agent remains with its original parent.'
                 : 'Conversation ended by you. The original window is stopping remaining work and preparing the handoff.' });
             } else {
@@ -181,10 +174,10 @@ export async function serveWindows(directory: string, children: Children, availa
         const message = displayable[cursor++];
         let text = message.role === 'toolResult' ? '' : textContent(message.content);
         if (message.role === 'user' && firstUser) { text = task; firstUser = false; said.add(task.trim()); }
-        if (message.role === 'user') { if (text) send({ kind: 'event', name: 'message', from: said.has(text.trim()) ? 'user' : undefined, text: shorten(text, 200_000), cursor }); continue; }
+        if (message.role === 'user') { if (text) send({ kind: 'event', name: 'message', from: said.has(text.trim()) ? 'user' : undefined, text: shorten(text, 200_000) }); continue; }
         const clipped = clip(message);
-        if (fits(clipped)) send({ kind: 'event', name: 'message', from: message.role === 'assistant' ? 'agent' : undefined, text: shorten(text, 200_000), message: clipped, cursor });
-        else if (text) send({ kind: 'event', name: 'message', from: 'agent', text: shorten(text, 200_000), cursor });
+        if (fits(clipped)) send({ kind: 'event', name: 'message', from: message.role === 'assistant' ? 'agent' : undefined, text: shorten(text, 200_000), message: clipped });
+        else if (text) send({ kind: 'event', name: 'message', from: 'agent', text: shorten(text, 200_000) });
       }
       return true;
     };
@@ -194,7 +187,6 @@ export async function serveWindows(directory: string, children: Children, availa
       if (!info) {
         // Deleted from the Agents page: end the window (and a headless join) instead of leaving it waiting forever.
         ending = true;
-        releaseView?.(); releaseView = undefined;
         send({ kind: 'event', name: 'finished', text: 'This conversation was deleted from the Agents page.' });
         return;
       }
@@ -213,7 +205,6 @@ export async function serveWindows(directory: string, children: Children, availa
         try { if (!drainMessages(finalMessages ??= children.messages(child), info.task)) return; }
         catch (error) { send({ kind: 'event', name: 'message', text: `Could not read the final transcript: ${errorText(error)}` }); }
         ending = true;
-        releaseView?.(); releaseView = undefined;
         send({ kind: 'event', name: 'finished', text: attached ? `Agent ${child} is ${info.state}. Its report goes to its original parent; /complete closes only this view.` : info.handoff?.text ?? 'Conversation ended.' });
       }
     }, 150);
@@ -221,7 +212,6 @@ export async function serveWindows(directory: string, children: Children, availa
     const connection = ended.then(async () => {
       clearInterval(timer); controller.abort(); connections.delete(socket);
       await queue;
-      releaseView?.();
       if (child && !attached) await children.finish(child, closing ? 'owner-stopped' : 'disconnected');
     });
     track(connection);
@@ -258,16 +248,20 @@ export async function connectWindow(directory: string, event: (event: WindowEven
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', resolve); socket.once('error', reject);
     socket.setTimeout(connectTimeout, () => socket.destroy(new Error('Profile owner did not respond')));
+  }).catch((error: unknown) => {
+    const code = record(error) ? error.code : undefined;
+    throw code === 'ENOENT' || code === 'ECONNREFUSED'
+      ? new Error('No running OptChat session on this profile accepts connections. A headless run (pi -p) holding it does not accept connections; once it exits, open the profile instead.', { cause: error }) : error;
   });
   socket.setTimeout(0);
   return {
-    async request(action: Action, text?: string, cwd?: string, options: { timeout?: number; cursor?: number; activeOnly?: boolean } = {}) {
+    async request(action: Action, text?: string, cwd?: string, options: { timeout?: number; activeOnly?: boolean } = {}) {
       if (socket.destroyed) throw new Error('The original Pi window is disconnected');
       if (text && text.length > 256_000) throw new Error('Connected-window messages are limited to 256,000 characters');
       const id = next++;
       return await new Promise<string | undefined>((resolve, reject) => {
         const timer = setTimeout(() => { pending.delete(id); reject(new Error('Owner response timed out; closing this connection')); socket.destroy(); }, options.timeout ?? 120_000);
-        pending.set(id, { resolve, reject, timer }); send({ kind: 'request', id, action, text, cwd, cursor: options.cursor, activeOnly: options.activeOnly });
+        pending.set(id, { resolve, reject, timer }); send({ kind: 'request', id, action, text, cwd, activeOnly: options.activeOnly });
       });
     },
     close() { socket.destroy(); },
@@ -302,10 +296,7 @@ export async function joinHeadless(directory: string) {
     // waits for the owner's user instead, and a finished one ends with `finished` once its last messages are sent.
     else if (event.name === 'status' && event.live?.state === 'waiting' && !event.live.agents) settle({});
     else if (event.name === 'finished') settle({ ended: event.text });
-  }, () => settle({ lost: true })).catch((error: unknown) => {
-    const code = record(error) ? error.code : undefined;
-    throw code === 'ENOENT' || code === 'ECONNREFUSED' ? new Error('No running OptChat session on this profile to join') : error;
-  });
+  }, () => settle({ lost: true }));
   let asked = false;
   return {
     async ask(text: string, cwd: string) {

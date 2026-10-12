@@ -17,6 +17,7 @@ import { asUser, boundedMessage, atWork, buildContext, logMessage, previousExcha
 import { registerReportRenderer, type ReportDetails } from './report-message.ts';
 import { memoryTools, result, searchTool } from './tools.ts';
 import { Children, CWD_DOC, loadedBuiltins } from './agents.ts';
+import { isActiveRun, type RunInfo } from './runs.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
 import { checkpoint } from './checkpoint.ts';
@@ -217,7 +218,8 @@ export default function optchat(pi: ExtensionAPI) {
       rememberProfile(name);
       active = { name, dir, config, memory, inbox, children, usage, unlock }; fault = undefined; idle = () => ctx.isIdle();
       if (ctx.mode === 'tui') unmountNavigation = mountNavigation(ctx, children, memory, shortcut, page => { void inspect(ctx, page); });
-      closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
+      // A one-shot run (`pi -p`, JSON) exits after its own prompt, which would end every conversation connected to it.
+      if (ctx.mode !== 'print' && ctx.mode !== 'json') closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
       untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
       status(ctx);
       ctx.ui.notify(`${brand} · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
@@ -244,25 +246,21 @@ export default function optchat(pi: ExtensionAPI) {
     stopping = false;
     const entries = ctx.sessionManager.getEntries();
     const saved = entries.findLast(e => e.type === 'custom' && e.customType === binding);
-    const boundAgent = saved?.type === 'custom' && record(saved.data) && typeof saved.data.agentId === 'string' ? saved.data.agentId : undefined;
     const boundName = saved?.type === 'custom' && record(saved.data) && typeof saved.data.name === 'string' ? saved.data.name : undefined;
     // A session with conversation in it belongs to its profile. One that is only bound (a fresh `/optchat profile` session) may still pick another.
     const settled = boundName !== undefined && entries.some(e => e.type === 'message' || e.type === 'custom_message');
     const flag = pi.getFlag('optchat-profile');
     try {
       if (boundName && typeof flag === 'string' && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
-      const requestedAgent = pi.getFlag('optchat-agent');
-      if (boundAgent && requestedAgent !== undefined && requestedAgent !== boundAgent) throw new Error(`Session belongs to agent ${boundAgent}; open a new Pi session for another agent.`);
-      const agentId = requestedAgent ?? boundAgent;
+      const agentId = pi.getFlag('optchat-agent');
       if (agentId !== undefined) {
         if (typeof agentId !== 'string' || !agentId.trim()) throw new Error('--optchat-agent requires an exact agent ID');
         if (ctx.mode !== 'tui') { process.exitCode = 1; throw new Error('--optchat-agent requires interactive Pi (not print, JSON or RPC mode)'); }
-        if (settled && !boundAgent) throw new Error('This session already contains a main conversation. Open the agent in a fresh Pi session.');
+        if (settled) throw new Error('This session already contains a main conversation. Open the agent in a fresh Pi session.');
         const name = boundName ?? (typeof flag === 'string' ? flag : undefined);
         if (!name) throw new Error('--optchat-agent needs a profile: pass --optchat-profile');
         remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId);
         fault = undefined;
-        if (name !== boundName || agentId !== boundAgent) pi.appendEntry(binding, { name, agentId });
         // Pi sets its own title after session_start; retain the attached window title too.
         for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
         return;
@@ -284,7 +282,7 @@ export default function optchat(pi: ExtensionAPI) {
           // Older owners have no listing protocol. Keep their existing Connect/Back menu rather than failing startup.
           const listed = settled ? undefined : await listAttachableAgents(profilePath(name)).catch(() => undefined);
           const agents = listed ?? [];
-          const hint = listed?.length === 0 ? '\nNo unopened background agents are running. Ask the main agent to start one; already-open agents are hidden.' : '';
+          const hint = listed?.length === 0 ? '\nNo background agents are running. Ask the main agent to start one.' : '';
           const labels = new Map(agents.map(agent => [`Open subagent ${agent.id} · ${agent.state} · ${oneLine(agent.task).slice(0, 80)}`, agent.id]));
           const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}${hint}`,
             [CONNECT, ...labels.keys(), ...(settled ? [] : [BACK])]);
@@ -292,13 +290,13 @@ export default function optchat(pi: ExtensionAPI) {
           if (agentId) {
             try {
               remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId, true);
-              fault = undefined; pi.appendEntry(binding, { name, agentId });
-              // Keep the specific agent binding instead of overwriting it below with just the profile.
+              fault = undefined;
+              // An attached terminal saves no profile binding: its Pi session never persists, so there is nothing to resume.
               for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
               return;
             } catch (error) {
               ctx.ui.notify(errorText(error), 'error');
-              continue; // Another view may have claimed it while the menu was open: refresh, never spawn a replacement.
+              continue; // It may have finished while the menu was open: refresh, never spawn a replacement.
             }
           }
           if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
@@ -319,8 +317,28 @@ export default function optchat(pi: ExtensionAPI) {
   });
   pi.on('session_info_changed', () => title.reapply()); // Pi retitles the tab on session renames, just before this.
   pi.on('session_shutdown', stop);
-  pi.on('session_before_switch', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
-  pi.on('session_before_fork', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
+  // Pi shows nothing when a switch is cancelled, so say why and what lets it through.
+  const blockSwitch = (command: string, ctx: ExtensionContext) => {
+    const children = active?.children, runs = children?.active ? children.ids.flatMap(id => children.live(id)?.info ?? []) : [];
+    const label = (run: RunInfo) => !isActiveRun(run) ? 'finishing' : run.connected ? 'connected window'
+      : run.state === 'paused' ? 'interrupted, waiting for you' : run.state === 'stopping' ? 'stopping' : 'working';
+    const own = runs.filter(run => !run.connected), it = own.length === 1 ? 'it' : 'them';
+    const how = [
+      ...own.length ? [own.some(run => run.state === 'paused') ? `Open ${it} in /optchat agents and message ${it} to resume, or press Ctrl+X twice to stop.`
+        : `Wait for ${it} to finish, or open ${it} in /optchat agents and press Ctrl+X twice.`] : [],
+      ...runs.length > own.length ? [own.length || runs.length > 1 ? 'A connected window\'s agent ends when its window runs /complete or closes.' : 'It ends when that window runs /complete or closes.'] : [],
+    ];
+    const why = remote && !remote.ended ? 'in a connected window. Run /complete to end this conversation, then open a new Pi window.'
+      : importing ? 'while an import is open. Close the import dialog or pause the import (Escape), then try again.'
+      : !children?.active ? undefined
+      : !runs.length ? 'while agents are starting or finishing. Try again in a moment.'
+      : `while ${runs.length === 1 ? '1 agent is' : `${runs.length} agents are`} active: ${runs.map(run => `${run.id} (${label(run)})`).join(', ')}. ${how.join(' ')}`;
+    if (!why) return undefined;
+    ctx.ui.notify(`${command} is blocked ${why}`, 'warning');
+    return { cancel: true };
+  };
+  pi.on('session_before_switch', (event, ctx) => blockSwitch(event.reason === 'new' ? '/new' : '/resume', ctx));
+  pi.on('session_before_fork', (event, ctx) => blockSwitch(event.position === 'at' ? '/clone' : '/fork', ctx));
   pi.on('input', async (event, ctx) => {
     if (joined) {
       try {
@@ -516,7 +534,7 @@ export default function optchat(pi: ExtensionAPI) {
   };
   pi.registerShortcut(shortcut, { description: 'Inspect OptChat agents, usage and background activity', handler: ctx => inspect(ctx, 'agents') });
   const command = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
-    if (remote) { ctx.ui.notify('Manage this profile in its original window. Here use /tell-main or /complete.', 'info'); return; }
+    if (remote && !remote.ended) { ctx.ui.notify('Manage this profile in its original window. Here use /tell-main or /complete.', 'info'); return; }
     if (importing) throw new Error('Close the import dialog before changing profile settings.');
     let action = args.trim();
     if (!action) {

@@ -7,7 +7,6 @@ import { spawn } from 'node:child_process';
 import { createServer, type Socket } from 'node:net';
 import { createAgentSession, DefaultResourceLoader, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
 import { TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { showAgentView } from '../src/agent-view.ts';
 import optchat from '../src/index.ts';
@@ -399,6 +398,7 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
     await f.children.finish(id, 'disconnected');
     assert.match(f.reports.at(-1) ?? '', /interrupted \(disconnected\)/);
     assert.match(f.reports.at(-1) ?? '', /Automatic summary unavailable.*Synthetic summarizer unavailable/);
+    assert.doesNotMatch(f.reports.at(-1) ?? '', /Stopped by the user|tell resumes it/, 'a window that ends is not stopped by the user, and resume refuses connected runs');
     assert.match(f.reports.at(-1) ?? '', /Full transcript:/);
     assert.equal(info.handoff?.delivered, true);
   } finally { await f.close(); }
@@ -636,12 +636,9 @@ test('attachment replays real tool results and follows a paused background agent
     assert.ok(f.reports.some(t => t.includes(`[${id}]`) && t.includes('finish the original task')));
     assert.ok(events.some(e => e.from === 'agent' && e.text.includes('finish the original task')));
     assert.equal(f.summaries.length, 0);
-    assert.equal(f.children.isViewed(id), false, 'finished frees the claim while this socket stays open');
-    const releaseInspector = f.children.claimView(id);
-    releaseInspector();
     await f.children.tell(id, 'hold work resumed by parent');
     const second = await connectWindow(f.dir, () => {}, () => {});
-    try { await second.request('attach', id); assert.equal(f.children.isViewed(id), true); }
+    try { await second.request('attach', id); }
     finally { second.close(); }
   } finally { client.close(); await close(); await f.close(); }
 });
@@ -725,7 +722,7 @@ test('SIGKILL of an attached terminal does not stop its existing background sess
   } finally { child.kill('SIGKILL'); await close(); await f.close(); }
 });
 
-test('the normal Pi extension CLI attaches directly, persists the agent binding, routes input, and shutdown only detaches', async () => {
+test('the normal Pi extension CLI attaches directly, saves no profile binding, routes input, and shutdown only detaches', async () => {
   const f = await fixture();
   const oldHome = process.env.OPTCHAT_HOME;
   process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-cli-home-'));
@@ -745,9 +742,7 @@ test('the normal Pi extension CLI attaches directly, persists the agent binding,
   try {
     await session.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => errors.push(error.error) });
     assert.deepEqual(errors, []);
-    const binding = session.sessionManager.getEntries().findLast(e => e.type === 'custom' && e.customType === 'optchat.profile');
-    assert.ok(binding?.type === 'custom');
-    assert.deepEqual(binding.data, { name: 'attach', agentId: id });
+    assert.equal(session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
     assert.equal(f.children.history.records.size, 1);
     const taskCopies = () => session.sessionManager.getEntries().filter(e => e.type === 'custom_message' && e.customType === 'optchat-connected' && e.content === 'hold work CLI existing session').length;
     await until(() => taskCopies() === 1);
@@ -758,26 +753,6 @@ test('the normal Pi extension CLI attaches directly, persists the agent binding,
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(f.children.history.records.get(id)?.state, 'running');
     assert.equal(f.children.history.records.get(id)?.handoff, undefined);
-    // A resumed client session reconnects to the same ID, not a new connected-window conversation.
-    const resumedLoader = new DefaultResourceLoader({ cwd: f.dir, agentDir: join(f.dir, 'client-agent'), settingsManager,
-      noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat] });
-    await resumedLoader.reload();
-    const { session: resumed } = await createAgentSession({ modelRuntime: f.runtime, model: f.registry.find('window-test', 'child'),
-      resourceLoader: resumedLoader, settingsManager, sessionManager: session.sessionManager, tools: [] });
-    const resumedErrors: string[] = [];
-    try {
-      await resumed.bindExtensions({ uiContext: ui, mode: 'tui', onError: error => resumedErrors.push(error.error) });
-      assert.deepEqual(resumedErrors, []);
-      assert.equal(f.children.history.records.size, 1);
-      await new Promise(resolve => setTimeout(resolve, 350));
-      assert.equal(taskCopies(), 1, 'resuming does not persist the original task a second time');
-      const cursorEntries = resumed.sessionManager.getEntries().filter(e => e.type === 'custom_message' && e.customType === 'optchat-connected' && typeof (e.details as { cursor?: number })?.cursor === 'number');
-      const cursors = cursorEntries.map(e => (e as { details: { cursor: number } }).details.cursor);
-      assert.equal(new Set(cursors).size, cursors.length, 'replayed committed messages occur only once');
-      await resumed.prompt('After client resume.');
-      assert.equal(f.children.history.records.get(id)?.guidance.at(-1)?.text, 'After client resume.');
-      assert.equal(f.children.history.records.get(id)?.handoff, undefined);
-    } finally { await resumed.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); resumed.dispose(); }
   } finally {
     await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose();
     await close(); await f.close();
@@ -809,7 +784,7 @@ test('a large finished transcript replays in bounded batches before the attached
   } finally { client.close(); await close(); await f.close(); }
 });
 
-test('the owner lists only live, unopened background agents and frees a terminal claim on detach', async () => {
+test('the owner lists live background agents, including ones already open in another view', async () => {
   const f = await fixture();
   const close = await serveWindows(f.dir, f.children, () => true, async () => {});
   const [one, two] = await f.children.spawn([{ task: 'hold work one' }, { task: 'hold work two' }], f.dir);
@@ -823,9 +798,8 @@ test('the owner lists only live, unopened background agents and frees a terminal
     assert.deepEqual(new Set(initial.map(a => a.id)), new Set([one, two]));
     assert.ok(initial.every(a => a.task.startsWith('hold work') && a.state === 'running'));
     await client.request('attach', one);
-    assert.deepEqual((await listAttachableAgents(f.dir)).map(a => a.id), [two]);
-    await client.request('complete');
     assert.deepEqual(new Set((await listAttachableAgents(f.dir)).map(a => a.id)), new Set([one, two]));
+    await client.request('complete');
     assert.equal(f.requests.length, calls, 'listing and selecting must not call a model');
     assert.equal(f.children.history.records.size, 4);
     assert.equal(f.children.history.records.get(connected)?.connected, true);
@@ -833,60 +807,25 @@ test('the owner lists only live, unopened background agents and frees a terminal
   } finally { client.close(); await close(); await f.close(); }
 });
 
-test('an agent open in the main inspector is excluded and protected until that view closes', async () => {
+test('views coexist: the main inspector and two terminals open the same agent, and each can steer it', async () => {
   const f = await fixture();
   const close = await serveWindows(f.dir, f.children, () => true, async () => {});
-  const [id] = await f.children.spawn([{ task: 'hold work main inspector' }], f.dir);
-  const client = await connectWindow(f.dir, () => {}, () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work shared views' }], f.dir);
+  const events: WindowEvent[][] = [[], []];
+  const clients = await Promise.all(events.map(list => connectWindow(f.dir, e => list.push(e), () => {})));
   const { promise: dismissed, resolve: dismiss } = Promise.withResolvers<void>();
   const ctx = { ui: { custom: async () => { await dismissed; } } } as unknown as ExtensionContext;
   const view = showAgentView(ctx, { id, children: f.children });
   try {
-    assert.equal(f.children.isViewed(id), true);
-    assert.deepEqual(await listAttachableAgents(f.dir), []);
-    await assert.rejects(client.request('attach', id), /already open in another window/);
-    dismiss(); await view;
-    assert.equal(f.children.isViewed(id), false);
-    await client.request('attach', id);
-    await assert.rejects(showAgentView(ctx, { id, children: f.children }), /already open in another window/);
-    await client.request('complete');
-    assert.equal(f.children.isViewed(id), false);
-  } finally { dismiss(); await view; client.close(); await close(); await f.close(); }
-});
-
-test('two simultaneous terminal claims have exactly one winner and a stale menu never spawns another agent', async () => {
-  const f = await fixture();
-  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
-  const [id] = await f.children.spawn([{ task: 'hold work exclusive attachment' }], f.dir);
-  const clients = await Promise.all([connectWindow(f.dir, () => {}, () => {}), connectWindow(f.dir, () => {}, () => {})]);
-  try {
+    await Promise.all(clients.map(c => c.request('attach', id)));
+    assert.ok(events.every(list => list.find(e => e.name === 'started')?.text === id));
     assert.equal((await listAttachableAgents(f.dir))[0]?.id, id);
-    const results = await Promise.allSettled(clients.map(c => c.request('attach', id)));
-    assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
-    const loser = results.find(r => r.status === 'rejected');
-    assert.ok(loser?.status === 'rejected'); assert.match(String(loser.reason), /already open/);
+    await clients[0].request('say', 'From the first terminal.');
+    await clients[1].request('say', 'From the second terminal.');
+    assert.deepEqual(f.children.history.records.get(id)?.guidance.map(g => g.text).slice(-2), ['From the first terminal.', 'From the second terminal.']);
     assert.equal(f.children.history.records.size, 1);
-    assert.deepEqual(await listAttachableAgents(f.dir), []);
-    const winnerIndex = results.findIndex(r => r.status === 'fulfilled');
-    clients[winnerIndex].close();
-    await until(() => !f.children.isViewed(id));
-    await clients[1 - winnerIndex].request('attach', id);
     assert.equal(f.children.history.records.get(id)?.state, 'running');
-  } finally { clients.forEach(c => c.close()); await close(); await f.close(); }
-});
-
-test('main view cleanup releases the claim even when the overlay fails', async () => {
-  const f = await fixture();
-  const [id] = await f.children.spawn([{ task: 'hold work overlay failure' }], f.dir);
-  const ctx = { ui: { custom: async () => { throw new Error('Overlay failed'); } } } as unknown as ExtensionContext;
-  try {
-    await assert.rejects(showAgentView(ctx, { id, children: f.children }), /Overlay failed/);
-    assert.equal(f.children.isViewed(id), false);
-    const release = f.children.claimView(id); release();
-    const other = f.children.claimView(id); release();
-    assert.equal(f.children.isViewed(id), true, 'an old release cannot drop a newer view');
-    other(); assert.equal(f.children.isViewed(id), false);
-  } finally { await f.close(); }
+  } finally { dismiss(); await view; clients.forEach(c => c.close()); await close(); await f.close(); }
 });
 
 async function menuClient(f: Awaited<ReturnType<typeof fixture>>, name: string,
@@ -905,15 +844,14 @@ async function menuClient(f: Awaited<ReturnType<typeof fixture>>, name: string,
   return { session, errors, async close() { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); } };
 }
 
-test('the busy-profile menu offers unopened subagents below Connect and selecting one opens that same session', async () => {
+test('the busy-profile menu offers background subagents below Connect and selecting one opens that same session', async () => {
   const f = await fixture();
   const oldHome = process.env.OPTCHAT_HOME;
   process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-home-'));
   createProfile('menu');
   const unlock = await lockProfile(profilePath('menu'), 'Main window');
   const close = await serveWindows(profilePath('menu'), f.children, () => true, async () => {});
-  const [available, occupied] = await f.children.spawn([{ task: 'hold work available' }, { task: 'hold work occupied' }], f.dir);
-  const releaseOccupied = f.children.claimView(occupied);
+  const [available] = await f.children.spawn([{ task: 'hold work available' }], f.dir);
   let choices: string[] = [];
   const client = await menuClient(f, 'menu', async (title, options) => {
     assert.match(title, /menu is open in another window/); choices = options;
@@ -924,47 +862,15 @@ test('the busy-profile menu offers unopened subagents below Connect and selectin
     assert.equal(choices[0], 'Start a connected subagent conversation here');
     assert.match(choices[1], new RegExp(`^Open subagent ${available}.*hold work available`));
     assert.equal(choices.at(-1), 'Back');
-    assert.ok(!choices.some(c => c.includes(occupied)));
-    const binding = client.session.sessionManager.getEntries().findLast(e => e.type === 'custom' && e.customType === 'optchat.profile');
-    assert.ok(binding?.type === 'custom'); assert.deepEqual(binding.data, { name: 'menu', agentId: available });
+    assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
     await client.session.prompt('Guidance via the menu-selected existing agent.');
     assert.equal(f.children.history.records.get(available)?.guidance.at(-1)?.text, 'Guidance via the menu-selected existing agent.');
-    assert.equal(f.children.history.records.size, 2);
-    assert.equal(f.children.isViewed(available), true);
+    assert.equal(f.children.history.records.size, 1);
     await client.close();
-    await until(() => !f.children.isViewed(available));
+    await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(f.children.history.records.get(available)?.state, 'running');
   } finally {
-    await client.close(); releaseOccupied(); await close(); await unlock(); await f.close();
-    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
-    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
-  }
-});
-
-test('a menu selection claimed while the menu is open is refused and the menu refreshes without spawning', async () => {
-  const f = await fixture();
-  const oldHome = process.env.OPTCHAT_HOME;
-  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-menu-race-'));
-  createProfile('menu');
-  const unlock = await lockProfile(profilePath('menu'), 'Main window');
-  const close = await serveWindows(profilePath('menu'), f.children, () => true, async () => {});
-  const [id] = await f.children.spawn([{ task: 'hold work menu race' }], f.dir);
-  let release = () => {}, menus = 0;
-  const client = await menuClient(f, 'menu', async (title, options) => {
-    menus++;
-    if (menus === 1) { const selection = options.find(o => o.startsWith(`Open subagent ${id}`)); assert.ok(selection); release = f.children.claimView(id); return selection; }
-    assert.ok(!options.some(o => o.includes(id)), 'refresh removes the now-open agent');
-    assert.match(title, /No unopened background agents are running/);
-    return undefined;
-  });
-  try {
-    assert.equal(menus, 2);
-    assert.ok(client.errors.some(e => /already open/.test(e)));
-    assert.equal(f.children.history.records.size, 1);
-    assert.equal(f.children.history.records.get(id)?.state, 'running');
-    assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
-  } finally {
-    await client.close(); release(); await close(); await unlock(); await f.close();
+    await client.close(); await close(); await unlock(); await f.close();
     rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
     if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
   }
@@ -1056,84 +962,10 @@ test('a menu agent that finishes before selection is rejected and the menu refre
   try {
     assert.equal(menus, 2);
     assert.ok(client.errors.some(e => /no longer available in the menu/.test(e)));
-    assert.equal(f.children.isViewed(id), false);
     assert.equal(f.children.history.records.size, 1);
     assert.equal(client.session.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === 'optchat.profile'), false);
   } finally {
     await client.close(); await close(); await unlock(); await f.close();
-    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
-    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
-  }
-});
-
-test('attachment resumes a saved replay cursor without replaying committed history, and rejects out-of-range cursors', async () => {
-  const f = await fixture();
-  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
-  const [id] = await f.children.spawn([{ task: 'Historical replay cursor task' }], f.dir);
-  await until(() => !f.children.live(id));
-  const events: WindowEvent[] = [];
-  const first = await connectWindow(f.dir, e => events.push(e), () => {});
-  try {
-    await first.request('attach', id);
-    await until(() => events.some(e => e.name === 'finished'));
-    const cursor = events.filter(e => e.name === 'message').at(-1)?.cursor;
-    assert.ok(cursor && cursor > 0);
-    const replay: WindowEvent[] = [];
-    const second = await connectWindow(f.dir, e => replay.push(e), () => {});
-    try {
-      await assert.rejects(second.request('attach', id, undefined, { cursor: cursor + 100 }), /beyond this agent transcript/);
-      assert.equal(f.children.isViewed(id), false);
-      await second.request('attach', id, undefined, { cursor });
-      await until(() => replay.some(e => e.name === 'finished'));
-      assert.equal(replay.filter(e => e.name === 'message').length, 0);
-    } finally { second.close(); }
-  } finally { first.close(); await close(); await f.close(); }
-});
-
-test('a resumed attached view keeps committed tool turns once and replays an uncommitted tool call with its new result', async () => {
-  const f = await fixture();
-  const oldHome = process.env.OPTCHAT_HOME;
-  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-replay-turn-'));
-  createProfile('replay');
-  const close = await serveWindows(profilePath('replay'), f.children, () => true, async () => {});
-  const [id] = await f.children.spawn([{ task: 'descendant-evidence-task' }], f.dir);
-  await until(() => !!f.children.live(id)?.streaming && f.children.live(id)!.session.messages.some(m => m.role === 'toolResult'));
-  await f.children.interrupt(id);
-  await until(() => f.children.history.records.get(id)?.state === 'paused');
-  type Entry = { type: 'custom_message'; customType: string; content: string; details?: { from?: string; turn?: AgentMessage[]; cursor?: number; agentId?: string } };
-  const entries: Entry[] = [];
-  const pi = { sendMessage: (message: Omit<Entry, 'type'>) => entries.push({ ...message, type: 'custom_message' }) } as unknown as ExtensionAPI;
-  const ctx = { cwd: f.dir, sessionManager: { getEntries: () => entries },
-    ui: { setStatus() {}, setWidget() {}, notify() {}, setTitle() {} } } as unknown as ExtensionContext;
-  let window: Awaited<ReturnType<typeof openConnectedWindow>> | undefined;
-  const committedEvidence = () => entries.filter(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'evidence')).length;
-  const committedPending = () => entries.filter(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'pending')).length;
-  try {
-    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
-    await until(() => committedEvidence() === 1);
-    const session = f.children.live(id)!.session;
-    const pending: AssistantMessage = { role: 'assistant', content: [{ type: 'toolCall', id: 'pending', name: 'bash', arguments: { command: 'echo new-result' } }],
-      api: 'openai-completions', model: 'child', provider: 'window-test', usage: emptyUsage(), stopReason: 'toolUse', timestamp: Date.now() };
-    // The existing view sees the call, but it is not a persisted turn until its result arrives.
-    session.messages.push(pending);
-    await new Promise(resolve => setTimeout(resolve, 350));
-    assert.equal(entries.some(e => e.details?.turn?.includes(pending)), false);
-    window.close();
-    await until(() => !f.children.isViewed(id));
-    session.messages.push({ role: 'toolResult', toolCallId: 'pending', toolName: 'bash', content: [{ type: 'text', text: 'new-result' }], isError: false, timestamp: Date.now() });
-    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
-    await until(() => committedPending() === 1);
-    assert.equal(committedEvidence(), 1, 'previously committed tool calls/results are not added again');
-    const turn = entries.find(e => e.details?.turn?.some(m => m.role === 'toolResult' && m.toolCallId === 'pending'))!.details!.turn!;
-    assert.equal(turn[0].role, 'assistant');
-    assert.ok(turn[0].role === 'assistant' && turn[0].content.some(p => p.type === 'toolCall' && p.id === 'pending'));
-    assert.equal(entries.filter(e => e.details?.from === 'user' && e.content === 'descendant-evidence-task').length, 1);
-    window.close(); await until(() => !f.children.isViewed(id));
-    window = await openConnectedWindow(pi, ctx, 'replay', undefined, id);
-    await new Promise(resolve => setTimeout(resolve, 350));
-    assert.equal(committedEvidence(), 1); assert.equal(committedPending(), 1, 'a second resume remains idempotent');
-  } finally {
-    window?.close(); await close(); await f.close();
     rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
     if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
   }
