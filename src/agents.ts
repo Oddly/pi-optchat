@@ -11,6 +11,7 @@ import { windowHandoff, CONNECTED, cutOffChildren, delegation, NO_DELEGATION, NO
 import { memoryTools } from './tools.ts';
 import { searchTool } from './core/tools.ts';
 import { VIEW } from './core/memory.ts';
+import { noteLimits, noteRefusal } from './limits.ts';
 import type { Memory } from './memory.ts';
 import type { ModelChoice } from './profiles.ts';
 import { cachePayload } from './core/cache.ts';
@@ -52,6 +53,8 @@ const STOPPED: Record<StopCause, string> = {
 };
 const stoppedReport = (cause: StopCause, text = '') => `${STOPPED[cause]}${text ? `\n\nIts last message before the stop:\n${text}` : ''}`;
 interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
+  /** The profile's folder where the children's answers keep the subscription's limits (limits.ts): the headers of each, and the refusal one ends in. */
+  limits?: string;
   /** Names of the built-in extensions the main session loaded (see `loadedBuiltins`). */
   builtins?: () => Iterable<string>;
   /** Journals the reports a main-agent spawn has so far while its other children still run (none: the batch was delivered), so a crash cannot lose them. */
@@ -220,6 +223,7 @@ export class Children {
         live.streaming = undefined;
       }
       if (event.type === 'turn_end' || event.type === 'agent_settled') this.options.usage?.backfill(live.session.sessionManager.getEntries(), live.info.parentSession, 'subagent', live.info.id);
+      if (event.type === 'turn_end' && event.message.role === 'assistant' && this.options.limits) noteRefusal(this.options.limits, event.message.errorMessage);
       if (event.type === 'message_start' && event.message.role === 'user') {
         const text = textContent(event.message.content);
         const guidance = live.prompting ?? live.info.guidance.find(g => g.state === 'queued' && sentText(g) === text);
@@ -350,6 +354,7 @@ export class Children {
           if (live && primed) { live.primed = undefined; await abortable(primed, ctx.signal); }
           return ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload;
         });
+        pi.on('after_provider_response', event => { if (this.options.limits) noteLimits(this.options.limits, event.headers); });
       }],
     });
     await loader.reload();
