@@ -19,7 +19,7 @@ import { boundedMessage, refreshedRun, refreshBudget, refreshPoint } from './cor
 import { registerReportRenderer, type ReportDetails } from './report-message.ts';
 import { memoryTools } from './tools.ts';
 import { result, searchTool } from './core/tools.ts';
-import { Children, loadedBuiltins, modelsTool, refreshContextFiles, TASKS } from './agents.ts';
+import { Children, loadedBuiltins, modelsTool, refreshContextFiles, TASKS, type ReportOptions } from './agents.ts';
 import { isActiveRun, type RunInfo } from './runs.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
@@ -86,8 +86,8 @@ export default function optchat(pi: ExtensionAPI) {
   let wake = false;
   let fault: string | undefined;
   /** Reports not yet in memory. `count`: how many subagent reports the text joins. `batch`: held while the rest of that spawn runs, not sent yet.
-   * `steered`: last sent into a running turn, where Esc or a dequeue can clear it from Pi's queue unseen. */
-  let reports: { text: string; count?: number; batch?: string; steered?: boolean }[] = [];
+   * `steered`: last sent into a running turn, where Esc or a dequeue can clear it from Pi's queue unseen. `quiet`: see ReportOptions. */
+  let reports: { text: string; count?: number; quiet?: boolean; batch?: string; steered?: boolean }[] = [];
   type Report = (typeof reports)[number];
   let idle = () => true;
   const receipts = new Map<AgentMessage, string>();
@@ -107,8 +107,8 @@ export default function optchat(pi: ExtensionAPI) {
     if (a) title.show(text => ctx.ui.setTitle(text), mainTitle(a.name, working, a.children.ids.length));
   };
   /** Journals written before batches held plain strings. */
-  const isPendingReport = (s: unknown): s is string | { text: string; count?: number } =>
-    typeof s === 'string' || record(s) && typeof s.text === 'string' && (s.count === undefined || typeof s.count === 'number');
+  const isPendingReport = (s: unknown): s is string | { text: string; count?: number; quiet?: boolean } =>
+    typeof s === 'string' || record(s) && typeof s.text === 'string' && (s.count === undefined || typeof s.count === 'number') && (s.quiet === undefined || typeof s.quiet === 'boolean');
   const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
   pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
   pi.registerFlag('optchat-connect', { description: 'pi -p or RPC on a profile open in another Pi: auto (join it if busy, default), join (only join), off (error if busy)', type: 'string', default: 'auto' });
@@ -195,13 +195,17 @@ export default function optchat(pi: ExtensionAPI) {
   };
   // Shown as a dark background box, not as the user's own message.
   const sendReport = (report: Report) => {
-    const { text, count } = report;
-    report.steered = !idle();
-    pi.sendMessage<ReportDetails>({ customType: REPORT_TYPE, content: text, display: true, details: { count } }, { triggerTurn: true, deliverAs: 'steer' });
+    const message = ({ text, count }: Report) => ({ customType: REPORT_TYPE, content: text, display: true, details: { count } });
+    if (report.quiet) { pi.sendMessage<ReportDetails>(message(report), { deliverAs: 'nextTurn' }); return; }
+    // A running turn takes this report now, ahead of the quiet ones Pi holds for the next turn: they go in first (their held copy is dropped).
+    for (const r of [...idle() ? [] : reports.filter(r => r.quiet && !r.steered && r !== report), report]) {
+      r.steered = !idle();
+      pi.sendMessage<ReportDetails>(message(r), { triggerTurn: true, deliverAs: 'steer' });
+    }
   };
-  const deliverReport = async (text: string, { once = false, count }: { once?: boolean; count?: number } = {}) => {
+  const deliverReport = async (text: string, { once = false, count, quiet }: ReportOptions = {}) => {
     if (once && (active?.memory.root.some(e => e.receipt === reportReceipt(text)) || reports.some(r => r.text === text))) return;
-    const report = { text, count };
+    const report = { text, count, quiet };
     reports.push(report); saveReports();
     if (!stopping) sendReport(report);
   };
@@ -290,7 +294,7 @@ export default function optchat(pi: ExtensionAPI) {
           summarizeHandoff: createHandoffSummarizer(ctx.modelRegistry, () => config.compactor, message => usage.compression(message, 'compactor', sessionId)) });
       const loggedReports = new Set(memory.root.map(e => e.receipt));
       // Reports a crash held back with their unfinished siblings are delivered now, as they are.
-      reports = saved.map(s => typeof s === 'string' ? { text: s } : { text: s.text, count: s.count })
+      reports = saved.map(s => typeof s === 'string' ? { text: s } : { text: s.text, count: s.count, quiet: s.quiet })
         .filter(r => !loggedReports.has(reportReceipt(r.text)));
       atomicWrite(pending, JSON.stringify(reports));
       rememberProfile(name);
@@ -304,11 +308,13 @@ export default function optchat(pi: ExtensionAPI) {
       ctx.ui.notify(`${brand} · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
       const queuedReports = [...reports];
       if (!pendingImport(dir)) {
+        // Queued before handoff recovery can start a turn, so a saved window start goes in ahead of that window's handoff.
+        for (const r of queuedReports) if (r.quiet) sendReport(r);
         const recover = (work: Promise<void>, what: string) => work.catch(error => ctx.ui.notify(`${what}: ${errorText(error)}`, 'error'));
         // Only an interactive Pi picks cut-off subagents up: a one-shot headless run would stop them again as it exits.
         recovery = Promise.all([recover(children.recoverHandoffs(), 'Handoff recovery'), ...ctx.mode === 'tui' ? [recover(children.resumeCutOff(), 'Resuming subagents')] : []]).then(() => {});
       }
-      setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const r of queuedReports) sendReport(r); });
+      setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const r of queuedReports) if (!r.quiet) sendReport(r); });
     } catch (error) {
       await closeWindows?.(); closeWindows = undefined;
       untitle?.(); untitle = undefined; title.clear();
@@ -492,6 +498,7 @@ export default function optchat(pi: ExtensionAPI) {
       catch (error) { ctx.ui.notify(`OptChat could not keep an image: ${errorText(error)}`, 'warning'); }
     }
     if (!active) return;
+    let ahead = -1;
     if (message.role === 'user') {
       try {
         const text = textContent(message.content);
@@ -502,6 +509,10 @@ export default function optchat(pi: ExtensionAPI) {
           if (reports.filter(r => !r.batch && r.text === text).length <= copies && (copies > 0 || active.memory.root.some(e => e.receipt === receipt)))
             return { message: { ...bounded, content: DUPLICATE_REPORT, display: false } };
           receipts.set(message, receipt);
+          // Pi puts a quiet report it held (a window's start) after the report that starts the turn (its handoff): it goes first.
+          const quiet = (text: string) => reports.some(r => r.quiet && r.text === text);
+          const at = run.findLastIndex(m => m.role === 'user' && !quiet(textContent(m.content)));
+          if (logged === 0 && quiet(text) && receipts.get(run[at])?.startsWith(REPORT_RECEIPT)) ahead = at;
         } else {
           // The inbox journaled the typed input: match without image references or Pi's image notes.
           const typed = typedText(message.content), skill = parseSkillBlock(typed.bare);
@@ -512,7 +523,7 @@ export default function optchat(pi: ExtensionAPI) {
         }
       } catch (error) { ctx.abort(); fault = errorText(error); ctx.ui.notify(fault, 'error'); }
     }
-    run.push(message);
+    if (ahead >= 0) run.splice(ahead, 0, message); else run.push(message);
     if (view !== undefined) {
       try { flush(); } catch (error) { ctx.abort(); fault = errorText(error); ctx.ui.notify(fault, 'error'); }
     }
