@@ -116,6 +116,7 @@ export default function optchat(pi: ExtensionAPI) {
   const title = new TabTitle();
   let working = false;
   let untitle: (() => void) | undefined;
+  let unstatus: (() => void) | undefined;
   const showTitle = (ctx: ExtensionContext) => {
     const a = active;
     if (a) title.show(text => ctx.ui.setTitle(text), mainTitle(a.name, working, a.children.ids.length));
@@ -246,6 +247,7 @@ export default function optchat(pi: ExtensionAPI) {
       await old.memory.close(); await old.unlock(); active = undefined;
       run = []; previous = []; logged = 0; keep = 0; view = undefined; runStarted = false; receipts.clear(); idle = () => true;
       untitle?.(); untitle = undefined; title.clear(); working = false;
+      unstatus?.(); unstatus = undefined;
     }
   };
   const CONNECT = 'Start a connected subagent conversation here', BACK = 'Back';
@@ -284,7 +286,7 @@ export default function optchat(pi: ExtensionAPI) {
     // Pi's RPC mode binds extensions twice after new_session/switch_session/fork/clone (setRebindSession, then rebindSession()),
     // so session_start can arrive again for the session this profile already serves. Taking the lock again would meet our own socket.
     // Only the same session is kept: another session without a session_shutdown still fails loudly below.
-    if (active?.name === name && active.session === ctx.sessionManager.getSessionId()) { await restoreMain(ctx, active); status(ctx); return; }
+    if (active?.name === name && active.session === ctx.sessionManager.getSessionId()) { await restoreMain(ctx, active); showTitle(ctx); status(ctx); return; }
     const unlock = await holdProfile(storeFor(dir), dir, name, describeOwner({ profile: name, pid: process.pid, host: hostname(), cwd: ctx.cwd }), warning => ctx.ui.notify(warning, 'warning'));
     let openingMemory: Memory | undefined;
     try {
@@ -297,7 +299,6 @@ export default function optchat(pi: ExtensionAPI) {
       if (!Array.isArray(saved) || !saved.every(isPendingReport)) throw new Error('Invalid pending report journal.');
       const memory = await Memory.open(memoryDirectory(dir), createCompressor(ctx.modelRegistry, () => config.compactor, { onUsage: message => {
         usage.compression(message, 'compactor', sessionId);
-        status(ctx);
       }, limits: dir, accepted: () => config.summaryAcceptBytes }), { warn: warning => ctx.ui.notify(warning, 'error'), jobs: config.jobs });
       openingMemory = memory;
       const inbox = new Inbox(dir);
@@ -319,7 +320,8 @@ export default function optchat(pi: ExtensionAPI) {
       if (ctx.mode !== 'print' && ctx.mode !== 'json') closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport, patch => configure(ctx, patch), (action, text) => {
         const reply = importFromApp(ctx, action, text); replying.add(reply); return reply;
       });
-      untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
+      untitle = children.subscribe(() => { showTitle(ctx); status(ctx); }); showTitle(ctx);
+      unstatus = memory.onChange(() => status(ctx));
       status(ctx);
       // An RPC host (the OptChat app) shows the profile itself; the banner would sit over its first prompt every start.
       if (ctx.mode !== 'rpc') ctx.ui.notify(`${brand} · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
@@ -336,6 +338,7 @@ export default function optchat(pi: ExtensionAPI) {
     } catch (error) {
       await closeWindows?.(); closeWindows = undefined;
       untitle?.(); untitle = undefined; title.clear();
+      unstatus?.(); unstatus = undefined;
       if (active && active.memory === openingMemory) {
         unmountNavigation?.(); unmountNavigation = undefined;
         await active.children.close(); active = undefined;
