@@ -82,7 +82,6 @@ export default function optchat(pi: ExtensionAPI) {
   /** After a mid-turn refresh (#146), the run is sent from here on, after its task; 0 sends it whole. */
   let keep = 0;
   let view: string | undefined;
-  let prompt = '';
   let runStarted = false;
   /** The run was started by a custom message (`sendMessage` with `triggerTurn` while idle): its first message is that input, shown or hidden. */
   let wake = false;
@@ -245,7 +244,7 @@ export default function optchat(pi: ExtensionAPI) {
       await old.memory.close(); await checkpoints;
     } finally {
       await old.memory.close(); await old.unlock(); active = undefined;
-      run = []; previous = []; logged = 0; keep = 0; view = undefined; runStarted = false; receipts.clear(); prompt = ''; idle = () => true;
+      run = []; previous = []; logged = 0; keep = 0; view = undefined; runStarted = false; receipts.clear(); idle = () => true;
       untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
@@ -503,7 +502,6 @@ export default function optchat(pi: ExtensionAPI) {
     event.systemPromptOptions.customPrompt = allowSearch(`${MASTER}\n\n${modelsHint(a.config.subagent)}\n\n${VIEW_DOC}${a.config.previousExchange ? CONTINUITY : ''}${a.config.memorySearch ? SEARCH_DOC : ''}`, a.config.memorySearch);
     event.systemPromptOptions.sections.instructions = `${readInstructions(a.dir)}\n\n${IMPORT_GUIDANCE}`;
     refreshContextFiles(event.systemPromptOptions);
-    prompt = event.systemPrompt;
   });
   const DUPLICATE_REPORT = '(duplicate report, already delivered)';
   pi.on('message_end', async (event, ctx) => {
@@ -569,10 +567,6 @@ export default function optchat(pi: ExtensionAPI) {
         view = a.memory.render(); // Capture old history before logging the new input.
         flush();
       }
-      // Extensions that run after ours (Pi's built-in MCP adds <mcp_servers>) still change the prompt; send what Pi has now.
-      // A prompt without our preamble keeps the last one we built.
-      const current = ctx.getSystemPrompt();
-      if (current.startsWith(MASTER.slice(0, 40))) prompt = current;
       // A turn past its budget moves its steps into the view, keeping the task and the last tool call whole (#146).
       const refresh = refreshPoint(run, keep, refreshBudget(ctx.model?.contextWindow, refreshFraction(a.config.refreshAt)));
       if (refresh) {
@@ -583,7 +577,7 @@ export default function optchat(pi: ExtensionAPI) {
         ctx.ui.notify(`OptChat moved ${Math.round(size / 4000)}k tokens of this turn into memory (${((Date.now() - began) / 1000).toFixed(1)}s).`, 'info');
       }
       // Built on every call, unlike the view, so it is never out of date; it goes last, after everything cached.
-      return { messages: buildContext(event.messages, refreshedRun(run, keep, TURN_REFRESHED), view, prompt, previous, atWork(a.children.working)) };
+      return { messages: buildContext(event.messages, refreshedRun(run, keep, TURN_REFRESHED), view, ctx.getSystemPrompt(), previous, atWork(a.children.working)) };
     } catch (error) {
       // Pi catches extension errors. Explicitly abort so it cannot fall back to old context.
       ctx.abort();

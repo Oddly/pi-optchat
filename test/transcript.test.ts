@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import { createAssistantMessageEventStream, type AssistantMessage, type Context, type ImageContent, type TextContent, type UserMessage } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Context, type ImageContent, type TextContent, type UserMessage } from '@earendil-works/pi-ai';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
 import { createProfile, loadConfig, profilePath, saveConfig } from '../src/profiles.ts';
@@ -54,6 +54,32 @@ test('retain the exact last answer and its requests, excluding prior working con
   assert.throws(() => buildContext(history, [], 'view', 'prompt', previous), /no current user message/);
   assert.throws(() => buildContext(history, [{ role: 'custom', customType: 'context', content: 'Supplementary instructions', display: false, timestamp: 1 }], 'view', 'prompt', previous), /no current user message/);
   assert.equal(final.content[0].type, 'thinking', 'the saved transcript must not be mutated');
+});
+
+test('context keeps request prompt sections and tool deltas together, using the fallback only without a system message', () => {
+  const current = user('Current task.'), tool = { name: 'read', description: 'Read a file', parameters: { type: 'object' } };
+  const canonical: AgentMessage[] = [
+    { role: 'system', content: 'Request prompt.', sections: { removed: 'OLD_SECTION', changed: 'OLD_VALUE' }, toolsAdded: [tool], timestamp: 1 },
+    user('Old history.'), current,
+    { role: 'system', content: '', sections: { removed: null, changed: 'CURRENT_VALUE' }, toolsRemoved: [{ name: 'read' }], timestamp: 2 },
+  ];
+  const saved = structuredClone(canonical), projected = buildContext(canonical, [current], 'memory', 'STALE_FALLBACK');
+  assert.match(getCurrentSystemPrompt(projected), /Request prompt\./);
+  assert.match(getCurrentSystemPrompt(projected), /CURRENT_VALUE/);
+  assert.doesNotMatch(JSON.stringify(projected), /OLD_SECTION|OLD_VALUE|STALE_FALLBACK|Old history/);
+  assert.deepEqual(getCurrentTools(projected), []);
+  assert.deepEqual(canonical, saved, 'projection never mutates the supplied request');
+  assert.equal(getCurrentSystemPrompt(buildContext([current], [current], 'memory', 'fallback')), 'fallback');
+  assert.equal(getCurrentSystemPrompt(buildContext([{ role: 'system', content: '', timestamp: 0 }, current], [current], 'memory', 'fallback')), '');
+  const reordered = buildContext([
+    { role: 'system', content: '', sections: { preamble: 'BASE', project_context: 'REPO_1', skills: 'SKILLS_1', cwd: 'CWD', instructions: 'PROFILE' }, timestamp: 1 },
+    { role: 'system', content: '', sections: { project_context: null, skills: null }, timestamp: 2 },
+    { role: 'system', content: '', sections: { project_context: 'REPO_2', skills: 'SKILLS_2', extra: 'EXTRA' }, timestamp: 3 },
+    current,
+  ], [current], 'memory', 'fallback');
+  const prompt = getCurrentSystemPrompt(reordered);
+  const positions = ['BASE', 'CWD', 'REPO_2', 'SKILLS_2', 'PROFILE', 'EXTRA'].map(part => prompt.indexOf(part));
+  assert.ok(positions.every((at, i) => at >= 0 && (i === 0 || at > positions[i - 1])), 'profile instructions stay after re-inserted project context and skills');
 });
 
 test('unsuccessful or unsettled runs preserve the earlier completed exchange', () => {
@@ -350,7 +376,7 @@ test('main agent keeps Pi\'s AGENTS.md files and skills, with profile instructio
       models: [{ id: 'fixture', name: 'Fixture', reasoning: false, input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
       streamSimple(model, context) {
-        const system = textContent(context.messages.find(m => m.role === 'system')?.content);
+        const system = getCurrentSystemPrompt(context.messages);
         if (system !== COMPACT) systems.push(system);
         const reply = answer(system === COMPACT ? 'Summary.' : 'Done.');
         reply.api = model.api; reply.provider = model.provider; reply.model = model.id;
@@ -375,6 +401,16 @@ test('main agent keeps Pi\'s AGENTS.md files and skills, with profile instructio
     writeFileSync(join(dir, 'AGENTS.md'), 'REPO_RULES_V2');
     await session.prompt('Again.');
     assert.ok(systems.at(-1)?.includes('REPO_RULES_V2'), 'an AGENTS.md edit reaches the next run without /reload');
+    rmSync(join(dir, 'AGENTS.md')); rmSync(join(agentDir, 'AGENTS.md'));
+    await session.prompt('Without context files.');
+    assert.ok(!systems.at(-1)?.includes('REPO_RULES_V2') && !systems.at(-1)?.includes('GLOBAL_RULES'));
+    writeFileSync(join(agentDir, 'AGENTS.md'), 'GLOBAL_RULES_V2');
+    writeFileSync(join(dir, 'AGENTS.md'), 'REPO_RULES_V3');
+    await session.prompt('Restored.');
+    const restored = systems.at(-1) ?? '';
+    const restoredOrder = ['GLOBAL_RULES_V2', 'REPO_RULES_V3', 'PROFILE_RULES'].map(rule => restored.indexOf(rule));
+    assert.ok(restoredOrder.every((at, i) => at >= 0 && (i === 0 || at > restoredOrder[i - 1])),
+      'restored AGENTS.md files still precede profile instructions');
   } finally {
     if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
     if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
