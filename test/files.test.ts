@@ -122,6 +122,13 @@ test('readRuns lists a profile\'s saved runs and leaves out one it can\'t read',
     writeFileSync(join(runs, 'a1.optchat.json'), JSON.stringify(run));
     writeFileSync(join(runs, 'b2.optchat.json'), '{"id":"b2"');
     assert.deepEqual(readRuns(dir), [run]);
+    const failed = { ...run, failure: { phase: 'guidance', message: 'Error: Synthetic dispatch failure' } };
+    writeFileSync(join(runs, 'a1.optchat.json'), JSON.stringify(failed));
+    assert.deepEqual(readRuns(dir), [failed]);
+    for (const failure of [null, {}, { phase: 1, message: 'invalid' }, { phase: 'guidance', message: null }]) {
+      writeFileSync(join(runs, 'a1.optchat.json'), JSON.stringify({ ...run, failure }));
+      assert.deepEqual(readRuns(dir), []);
+    }
   } finally { removeDir(home); }
 });
 

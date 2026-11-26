@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createServer, type Socket } from 'node:net';
-import { createAgentSession, DefaultResourceLoader, type ToolDefinition, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type TerminalInputHandler, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, type ToolDefinition, type AgentSession, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type TerminalInputHandler, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
 import { Editor, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { showAgentView } from '../src/agent-view.ts';
 import optchat from '../src/index.ts';
 import { Children } from '../src/agents.ts';
+import { readRun } from '../src/runs.ts';
 import { Memory } from '../src/memory.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
@@ -120,6 +121,121 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   return { control, contexts, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, runtime, choice, options, ledger,
     async close() { await children.close(); await memory.close(); await unlock(); removeDir(dir); } };
 }
+
+function blockNextStart(session: AgentSession) {
+  const entered = Promise.withResolvers<void>(), released = Promise.withResolvers<void>();
+  const before = session.extensionRunner.emitBeforeAgentStart.bind(session.extensionRunner);
+  session.extensionRunner.emitBeforeAgentStart = async (...args) => {
+    session.extensionRunner.emitBeforeAgentStart = before;
+    entered.resolve();
+    await released.promise;
+    return before(...args);
+  };
+  return { entered: entered.promise, release: released.resolve };
+}
+
+for (const channel of ['guidance', 'skill guidance', 'parent report'] as const) test(`an external callback queues ${channel} once and keeps the connected conversation open`, async () => {
+  const f = await fixture();
+  let gate: ReturnType<typeof blockNextStart> | undefined, callback: Promise<void> | undefined;
+  try {
+    if (channel === 'skill guidance') {
+      mkdirSync(join(f.dir, '.pi', 'skills', 'review'), { recursive: true });
+      writeFileSync(join(f.dir, '.pi', 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Reviews code.\n---\nREVIEW_SKILL_BODY\n');
+    }
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const live = f.children.live(id)!;
+    if (channel === 'parent report') {
+      await f.children.tell(id, 'spawn one', 'user');
+      await until(() => live.info.state === 'waiting' && [...f.children.history.records.values()].some(run => run.parentId === id));
+    }
+    gate = blockNextStart(live.session);
+    callback = live.session.sendCustomMessage({ customType: 'background-task', content: 'Background task succeeded.', display: true }, { triggerTurn: true, deliverAs: 'followUp' });
+    await gate.entered;
+    assert.equal(live.session.isStreaming, true);
+    assert.equal(live.info.state, 'waiting', 'the callback has not emitted agent_start yet');
+    const marker = channel === 'parent report' ? 'Need a decision from the main agent.' : 'Check the background result.';
+    if (channel !== 'parent report') {
+      await live.session.steer('Earlier queued parent report.');
+      await f.children.tell(id, channel === 'skill guidance' ? `/skill:review ${marker}` : marker, channel === 'skill guidance' ? 'user' : 'manager');
+    } else {
+      const descendant = [...f.children.history.records.values()].find(run => run.parentId === id)!;
+      const tool = f.children.live(descendant.id)!.session.agent.state.tools.find(tool => tool.name === 'tell_parent')!;
+      await tool.execute('callback-report', { message: marker });
+    }
+    await until(() => live.session.getSteeringMessages().some(text => text.includes(marker)) || !!live.info.handoff);
+    assert.equal(live.info.handoff, undefined, 'dispatch must not fail while the SDK callback owns the run');
+    assert.equal(live.info.state, 'running');
+    assert.equal(live.session.isStreaming, true, 'queueing is not completion');
+    gate.release();
+    await callback;
+    await until(() => live.info.state === 'waiting' && !live.session.isStreaming && live.session.messages.some(m => m.role === 'user' && textContent(m.content).includes(marker)));
+    assert.equal(live.session.messages.filter(m => m.role === 'user' && textContent(m.content).includes(marker)).length, 1);
+    assert.equal(f.requests.filter(text => text.includes(marker)).length, 1);
+    if (channel !== 'parent report') {
+      assert.deepEqual(live.info.guidance.map(g => g.state), ['delivered']);
+      if (channel === 'skill guidance') assert.ok(live.info.guidance[0].sent?.includes('REVIEW_SKILL_BODY'));
+      else assert.equal(live.info.guidance[0].sent, undefined, 'an earlier queued report must not be attributed to the guidance');
+    }
+    const handoff = await f.children.finish(id, 'complete');
+    assert.equal(live.info.state, 'completed');
+    assert.equal(handoff?.reason, 'complete');
+    assert.equal(live.info.failure, undefined);
+  } finally { gate?.release(); await callback?.catch(() => {}); await f.close(); }
+});
+
+test('an external callback updates the connected lifecycle without manager guidance', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const live = f.children.live(id)!, states: string[] = [];
+    const unsubscribe = f.children.subscribe(() => { if (live.session.isStreaming) states.push(live.info.state); });
+    try { await live.session.sendCustomMessage({ customType: 'background-task', content: 'Background task succeeded.', display: true }, { triggerTurn: true }); }
+    finally { unsubscribe(); }
+    await until(() => live.info.state === 'waiting' && !live.session.isStreaming);
+    assert.ok(states.includes('running'), 'an externally started run must not remain waiting');
+    assert.equal(live.info.handoff, undefined);
+    const handoff = await f.children.finish(id, 'disconnected');
+    assert.equal(live.info.state, 'interrupted');
+    assert.equal(handoff?.reason, 'disconnected');
+    assert.equal(live.info.failure, undefined);
+  } finally { await f.close(); }
+});
+
+test('a connected handoff preserves the original dispatch exception and phase in its saved run', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const session = f.children.live(id)!.session, prompt = session.prompt.bind(session);
+    session.prompt = async (text, options) => {
+      if (text.includes('synthetic dispatch failure')) throw new Error('Synthetic dispatch failure');
+      return prompt(text, options);
+    };
+    await f.children.tell(id, 'synthetic dispatch failure');
+    await until(() => !f.children.live(id));
+    const run = readRun(f.dir, id);
+    assert.equal(run.state, 'interrupted');
+    assert.equal(run.handoff?.reason, 'failed');
+    assert.equal(run.report, run.handoff?.text);
+    assert.deepEqual(run.failure, { phase: 'guidance', message: 'Error: Synthetic dispatch failure' });
+  } finally { await f.close(); }
+});
+
+test('an external callback provider error remains distinguishable from a dispatch exception', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    await f.children.live(id)!.session.sendCustomMessage({ customType: 'background-task', content: 'provider-failure', display: true }, { triggerTurn: true });
+    await until(() => !f.children.live(id));
+    const run = readRun(f.dir, id);
+    assert.equal(run.state, 'interrupted');
+    assert.equal(run.handoff?.reason, 'failed');
+    assert.deepEqual(run.failure, { phase: 'response', message: 'Task error: Synthetic provider error' });
+  } finally { await f.close(); }
+});
 
 test('connected window keeps one real SDK conversation, communicates both ways, and completes its subtree with one handoff', async () => {
   const f = await fixture();

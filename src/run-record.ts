@@ -17,6 +17,7 @@ export interface RunInfo {
   parentSession: string; sessionFile?: string; started: number; ended?: number;
   parentId?: string; depth: number;
   state: RunState; report?: string;
+  failure?: { phase: string; message: string };
   connected?: boolean;
   /** A connected window whose agent runs in its own Pi process (an RPC host's second session on a busy profile): `pid` is that
    * process, `session` its Pi session file, read when the window ends. The record is all this process has of it. `after`: a window
@@ -38,6 +39,7 @@ function isRun(value: unknown): value is RunInfo {
     && (value.title === undefined || typeof value.title === 'string')
     && (value.sessionFile === undefined || typeof value.sessionFile === 'string')
     && (value.report === undefined || typeof value.report === 'string')
+    && (value.failure === undefined || record(value.failure) && typeof value.failure.phase === 'string' && typeof value.failure.message === 'string')
     && (value.connected === undefined || typeof value.connected === 'boolean')
     && (value.cutOff === undefined || typeof value.cutOff === 'boolean')
     && (value.window === undefined || record(value.window) && typeof value.window.pid === 'number' && (value.window.session === undefined || typeof value.window.session === 'string')
