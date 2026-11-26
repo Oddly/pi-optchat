@@ -16,7 +16,7 @@ import type { Memory } from './memory.ts';
 import type { ModelChoice } from './profiles.ts';
 import { cachePayload } from './core/cache.ts';
 import { childInput } from './core/messages.ts';
-import { alive, runMessages, runsElsewhere, CUT_OFF, reportHead, RunHistory, isActiveRun, isRunning, transition, sessionMessages, savedSession, undelivered, sentText, queuedWindows, unqueueWindow, type Guidance, type RemoteWindow, type RunInfo, type RunState, type FinishReason } from './runs.ts';
+import { alive, runMessages, runsElsewhere, CUT_OFF, reportHead, RunHistory, isActiveRun, isRunning, transition, sessionMessages, savedSession, undelivered, sentText, queuedWindows, unqueueWindow, type Guidance, type RemoteHandoff, type RemoteWindow, type RunInfo, type RunState, type FinishReason } from './runs.ts';
 import { UsageLedger } from './usage.ts';
 import { fullChat, refreshFraction, textContent } from './transcript.ts';
 import { Type, type Static } from 'typebox';
@@ -145,7 +145,9 @@ const level = ({ depth, connected }: Pick<RunInfo, 'depth' | 'connected'>) => co
 export class Children {
   private readonly running = new Map<string, LiveRun>();
   /** Windows in their own Pi that are connected now, by run ID: see connectWindow(). */
-  private readonly windows = new Map<string, (text: string) => boolean>();
+  private readonly windows = new Map<string, { send: (text: string) => boolean; receives: boolean }>();
+  /** Remote windows currently writing their /complete handoff, so tell refuses them even if they reconnect. */
+  private readonly completingWindows = new Set<string>();
   readonly history: RunHistory;
   private readonly listeners = new Set<() => void>();
   private closing = false;
@@ -402,14 +404,18 @@ export class Children {
   /** A parent that takes its children's reports: a live run here, or a window in its own Pi while its socket is open. */
   private parentRun(id: string) { return this.running.get(id)?.info ?? (this.windows.has(id) ? this.history.records.get(id) : undefined); }
   /**
-   * Opens the way to a window in its own Pi (see serveWindows): its children's reports and messages go through `send`, which
-   * says false once the window can't take them. Returns the close.
+   * Opens the way to a window in its own Pi (see serveWindows): its children's reports and main-agent guidance go through `send`,
+   * which says false once the window can't take them. `receives`: whether the window handles incoming `message` events (absent on
+   * pi-optchat 0.12.2 and earlier). Returns the close.
    */
-  connectWindow(id: string, send: (text: string) => boolean) {
-    this.windows.set(id, send);
+  connectWindow(id: string, send: (text: string) => boolean, { receives = true } = {}) {
+    const entry = { send, receives };
+    this.windows.set(id, entry);
     void this.cutOffUnder(id, true).catch(error => this.warn(`Could not tell window ${id} about its stopped subagents: ${String(error)}`));
-    return () => { if (this.windows.get(id) === send) this.windows.delete(id); };
+    return () => { if (this.windows.get(id) === entry) this.windows.delete(id); };
   }
+  /** Records that a remote window has started /complete and is writing its handoff. */
+  markCompleting(id: string) { this.completingWindows.add(id); }
   /** A window's subagents that a Pi restart cut off (see resumeCutOff), named once it reconnects, whose tell resumes them (they stay
    * cut off till then, so their own cut-off agents are named to them as they resume), or once it has ended to the main chat. */
   private async cutOffUnder(id: string, open: boolean) {
@@ -423,7 +429,7 @@ export class Children {
   /** A report or message for a window in its own Pi: to it while it is open, else to the main chat, saying whose it was. */
   private async toWindow(id: string, text: string, count?: number) {
     const window = this.history.records.get(id);
-    if (window && runsElsewhere(window) && this.windows.get(id)?.(text)) return;
+    if (window && runsElsewhere(window) && this.windows.get(id)?.send(text)) return;
     await this.report(`${text}\n\n(For connected window ${id}, which has ended, so it reaches you instead.)`, { count });
   }
   /** A mid-run message to a child's parent: false if that parent is no longer running. */
@@ -590,7 +596,17 @@ export class Children {
   async tell(id: string, message: string, source: 'manager' | 'user' = 'manager', caller?: string) {
     if (this.deleting.has(id)) throw new Error(`${id} is being deleted by the user.`);
     const live = this.running.get(id), run = this.history.records.get(id);
-    if (!live && run && runsElsewhere(run)) throw new Error(`${id} is a connected window running in its own Pi process, which tell can't reach. Its handoff arrives when it ends.`);
+    if (!live && run && runsElsewhere(run)) {
+      const trimmed = message.trim();
+      if (!trimmed) throw new Error('Message is empty.');
+      if (this.completingWindows.has(id)) throw new Error(`${id} is finishing. Its handoff will arrive on its own.`);
+      const target = this.windows.get(id);
+      if (!target) throw new Error(`${id} is a connected window in its own Pi process and is not connected right now, so tell can't reach it. Its handoff arrives when it ends.`);
+      if (!target.receives) throw new Error(`${id} runs an older pi-optchat that can't receive tell messages. Update and restart that window to message it.`);
+      const text = source === 'manager' ? `[Main agent guidance]\n${trimmed}` : trimmed;
+      if (!target.send(text)) throw new Error(`${id} is a connected window in its own Pi process and is not connected right now, so tell can't reach it. Its handoff arrives when it ends.`);
+      return 'Message sent to the connected window.';
+    }
     if (!live && source === 'manager' && run) return this.track(this.resume(id, message, { caller }));
     if (live && !['running', 'waiting', 'paused'].includes(live.info.state)) throw new Error(`${id} is finishing. Its report will arrive on its own${live.info.connected || source === 'user' ? '' : '; tell it again after that to resume it'}.`);
     if (!live) throw new Error(`No running subagent ${id}.`);
@@ -768,21 +784,27 @@ export class Children {
    * (see `RunInfo.window`). Its agent loop, tools and transcript stay there; this process keeps its record and delivers its handoff.
    */
   async adopt(window: RemoteWindow, { announce = true } = {}) {
-    const { id, task, cwd, model, thinking, title, pid, session, after } = window, known = this.history.records.get(id);
+    const { id, task, cwd, model, thinking, title, pid, session, after, completing } = window, known = this.history.records.get(id);
     if (known && !runsElsewhere(known)) throw new Error(`${id} is already a run in this profile`);
+    if (completing) this.completingWindows.add(id);
     const where = { pid, session, after };
     this.save(known ? { ...known, window: where } : { id, task, cwd, model, thinking, ...(title ? { title } : {}), parentSession: this.options.parentSession ?? '',
       depth: 1, started: Date.now(), state: 'running', guidance: [], connected: true, window: where });
-    if (!known && announce) await this.report(`[${id}] User started a connected conversation in ${cwd}, in a Pi window of its own. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${task}\n\nIt runs in another Pi process, so tell can't reach it. It sends a final handoff on completion or disconnect.`, { quiet: true });
+    if (!known && announce) await this.report(`[${id}] User started a connected conversation in ${cwd}, in a Pi window of its own. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${task}\n\nUse tell with this agent ID only if you know something it needs. It sends a final handoff on completion or disconnect.`, { quiet: true });
   }
-  /** A window in its own process has ended. `written`: the handoff it wrote itself (/complete); without one the compactor writes it from the window's transcript. */
-  async endRemote(id: string, reason: FinishReason, written?: string) {
+  /** A window in its own process has ended. `written`: the handoff it wrote itself (/complete), plus any guidance/reports it never read; without text the compactor writes it from the window's transcript. */
+  async endRemote(id: string, reason: FinishReason, written?: RemoteHandoff) {
+    this.completingWindows.delete(id);
     const run = this.history.records.get(id);
     if (!run?.window || run.handoff) return;
-    run.handoff = { reason }; run.ended = Date.now();
+    run.handoff = { reason, ...(written?.unread?.length ? { unread: written.unread } : {}) }; run.ended = Date.now();
+    if (written?.undelivered?.length) {
+      const now = Date.now();
+      run.guidance.push(...written.undelivered.map(text => ({ text, date: now, state: 'undelivered' as const, from: 'manager' as const })));
+    }
     transition(run, reason === 'complete' ? 'completed' : 'interrupted');
     this.save(run);
-    const work = this.deliverHandoff(run, undefined, written).then(() => this.cutOffUnder(id, false));
+    const work = this.deliverHandoff(run, undefined, written?.text).then(() => this.cutOffUnder(id, false));
     this.completions.add(work);
     try { await work; } finally { this.completions.delete(work); this.changed(); }
   }
@@ -790,13 +812,13 @@ export class Children {
     // Windows that found no owner queued themselves; one still running without a reason is left for later.
     for (const window of queuedWindows(this.profileDirectory)) {
       if (!window.reason && alive(window.pid)) continue;
-      const { reason = 'disconnected', text, ...rest } = window, known = this.history.records.get(window.id);
+      const { reason = 'disconnected', text, undelivered: missed, unread, ...rest } = window, known = this.history.records.get(window.id);
       try {
         if (!known || known.window && !known.handoff?.delivered) {
           // Its own ending wins over the `owner-stopped` one a restart gave a record whose window was gone by then.
           if (known && !isActiveRun(known)) delete known.handoff;
           else await this.adopt(rest, { announce: false });
-          await this.endRemote(window.id, reason, text);
+          await this.endRemote(window.id, reason, { text, undelivered: missed, unread });
         }
         unqueueWindow(this.profileDirectory, window.id);
       } catch (error) { this.warn(`Could not take the handoff of window ${window.id}: ${String(error)}`); }
@@ -822,7 +844,7 @@ export class Children {
       if (!written && deferred.aborted) return;
       // Written by the window itself, else by the compactor from every transcript (read after the window's try, which may have
       // checked things), else a labelled stub. A window in its own process wrote its handoff there, or it ended without one.
-      let summary = written;
+      let summary = written !== undefined ? withUndelivered(run, written) : undefined;
       if (run.window) this.keepTranscript(run);
       else try { summary = await this.writtenByWindow(run, live, deferred); }
       catch (error) {
@@ -841,7 +863,7 @@ export class Children {
           summary = await this.options.summarizeHandoff(run, evidence[0].messages, evidence.slice(1), deferred);
         } catch (error) {
           if (deferred.aborted) return;
-          summary = `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nUndelivered guidance: ${undelivered(run).join('\n')}\nRead the saved transcript or run metadata for the full work and user corrections.`;
+          summary = withUndelivered(run, `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nRead the saved transcript or run metadata for the full work and user corrections.`);
         }
       }
       const source = evidence.map(({ run: record, transcriptError }) => {

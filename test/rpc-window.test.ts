@@ -1,6 +1,6 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
@@ -410,6 +410,309 @@ test('a window\'s agent messages the main agent with tell_main, which only a win
     // It wakes the main agent, which reads it as the window agent's, not the user's.
     await until(() => owner.sent.some(s => s.messages.some(m => m.includes(`[${id}] Connected agent message: We are on BACK-1.`))));
     assert.ok(!owner.session.getActiveToolNames().includes('tell_main'), 'the main chat has no main to tell');
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('the main agent can message a connected remote window with tell, keeps it in handoff and zoom, and gets clear errors when disconnected, completing, or outdated', async () => {
+  const name = profile(), owner = await rpc(name), window = await rpc(name);
+  try {
+    await window.ask('Investigating the release.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    // The start notice reaches the main agent on its next turn and invites tell instead of saying it can't reach the window.
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes(`[${id}] User started a connected conversation`));
+    await owner.ask('Anything new?');
+    assert.match(owner.sent.at(-1)!.messages.join('\n'), new RegExp(`\\[${id}\\] User started a connected conversation[\\s\\S]*Use tell with this agent ID`));
+
+    const sent = await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Skip the staging check.' })}`);
+    assert.equal(sent, 'Reply: Message sent to the connected window.');
+    await until(() => window.sent.some(s => s.last === '[Main agent guidance]\nSkip the staging check.'));
+
+    // Also spawn a child subagent from the window so its report arrives in the window's session: it must not appear as USER in handoff or zoom.
+    await window.ask(`CALL spawn ${JSON.stringify({ tasks: [{ task: 'child work' }] })}`);
+    const [child] = readRuns(profilePath(name)).filter(run => run.task === 'child work');
+    await until(() => window.sent.some(s => s.last.startsWith(`[${child.id}] Reply:`)));
+
+    // An older window (no `receives: true` in registration) is refused with an update/restart error instead of silently dropping guidance.
+    const legacy = await connectWindow(profilePath(name), () => {}, () => {});
+    try {
+      await legacy.request('register', JSON.stringify({ id: 'legacy01', task: 'Old window', cwd: root, model: 'fixture/fixture', thinking: 'off', pid: process.pid }));
+      await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes('[legacy01] User started'));
+      await owner.ask('Drain start notice.');
+      const outdated = await owner.ask(`CALL tell ${JSON.stringify({ id: 'legacy01', message: 'Hello?' })}`);
+      assert.match(outdated ?? '', /older pi-optchat.*Update and restart/);
+    } finally { legacy.close(); }
+
+    // Wait for both interrupted handoff turns (legacy01 and window) to settle before calling zoom(id).
+    let settled = false;
+    const off = owner.session.subscribe(event => {
+      if (event.type === 'agent_settled' && owner.sent.some(s => s.last.includes(`[${id}] Connected conversation interrupted`))
+        && owner.sent.some(s => s.last.includes('[legacy01] Connected conversation interrupted'))) settled = true;
+    });
+    try {
+      await window.close();
+      await until(() => settled);
+    } finally { off(); }
+    const handoffInput = owner.sent.find(s => s.system.includes('handoff') && s.last.includes('Investigating the release.'))?.last ?? '';
+    assert.match(handoffInput, /MAIN AGENT: \[Main agent guidance\]\nSkip the staging check\./);
+    assert.doesNotMatch(handoffInput, new RegExp(`USER: \\[${child.id}\\]`), 'child subagent reports are not attributed as USER');
+    const zoomed = await owner.ask(`CALL zoom ${JSON.stringify({ id })}`);
+    assert.match(zoomed ?? '', /user\|\[Main agent guidance\]\nSkip the staging check\./);
+    assert.doesNotMatch(zoomed ?? '', new RegExp(`user\\|\\[${child.id}\\]`), 'child subagent reports are not shown as user in zoom');
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('tell refuses a disconnected remote window before reconnect and delivers once after it reconnects', async () => {
+  const name = profile();
+  // Hold the profile with a non-serving lock while a window starts so it runs disconnected without racing a 5s timer.
+  const unlock = await lockProfile(profilePath(name), `${name} · PID 1 · elsewhere`);
+  let owner: Awaited<ReturnType<typeof rpc>> | undefined;
+  const window = await rpc(name);
+  try {
+    await window.ask('Working offline.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    assert.equal(role?.role === 'window' && role.connected, false);
+    // Write the active run record directly, as an owner restart leaves behind before the window's socket reconnects.
+    mkdirSync(join(profilePath(name), 'runs'), { recursive: true });
+    writeFileSync(join(profilePath(name), 'runs', `${id}.optchat.json`), JSON.stringify({
+      id, task: 'Working offline.', cwd: root, model: 'fixture/fixture', thinking: 'off',
+      parentSession: '', depth: 1, started: Date.now(), state: 'running', guidance: [], connected: true,
+      window: { pid: process.pid },
+    }));
+    await unlock();
+    owner = await rpc(name);
+    // Before the window reconnects, tell refuses cleanly.
+    assert.equal(window.role()?.role === 'window' && (window.role() as Extract<Role, { role: 'window' }>).connected, false);
+    const disconnected = await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'While away.' })}`);
+    assert.match(disconnected ?? '', /not connected right now, so tell can't reach it/);
+
+    // A prompt reconnects and registers immediately; after that, tell delivers once.
+    await window.ask('Back online.');
+    await until(() => { const r = window.role(); return r?.role === 'window' && r.connected; });
+    const delivered = await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Also check the tag.' })}`);
+    assert.equal(delivered, 'Reply: Message sent to the connected window.');
+    await until(() => window.sent.some(s => s.last === '[Main agent guidance]\nAlso check the tag.'));
+    assert.equal(window.sent.filter(s => s.last === '[Main agent guidance]\nAlso check the tag.').length, 1);
+    assert.ok(!window.sent.some(s => s.last.includes('While away.')), 'refused tell was never delivered');
+  } finally { await unlock().catch(() => {}); await window.close(); await owner?.close(); }
+});
+
+test('tell refuses a remote window that is completing, even after the real window reconnects to a restarted owner mid-/complete', async () => {
+  const name = profile();
+  let releaseHandoff = () => {};
+  const handoff = new Promise<void>(resolve => { releaseHandoff = resolve; });
+  let owner = await rpc(name);
+  const window = await rpc(name, undefined, 'rpc', true, request => request.startsWith(HANDOFF_REQUEST) ? handoff : undefined);
+  try {
+    await window.ask('Wrapping up.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes(`[${id}] User started`));
+    await owner.ask('Drain start notice.');
+    const completing = window.ask('/complete');
+    await until(() => window.sent.some(s => s.last.startsWith(HANDOFF_REQUEST)));
+    assert.match(await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Too late.' })}`) ?? '', /is finishing/);
+
+    // Owner restarts while the real window is still writing its handoff: wait for the window's own reconnect timer to re-register with `completing`.
+    await owner.close();
+    await until(() => { const r = window.role(); return r?.role === 'window' && !r.connected; });
+    owner = await rpc(name);
+    await until(() => { const r = window.role(); return r?.role === 'window' && r.connected; });
+    assert.match(await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Still too late.' })}`) ?? '', /is finishing/);
+
+    releaseHandoff();
+    await completing;
+    assert.ok(!window.sent.some(s => s.last.includes('Too late.') || s.last.includes('Still too late.')));
+    const handoffOf = (s: { last: string }) => new RegExp(`^\\[${id}\\] Connected conversation completed by user`).test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.match(delivered, /Handoff: the user asked about the colour/);
+    assert.doesNotMatch(delivered, /Too late|Subagent reports that arrived/);
+  } finally { releaseHandoff(); await window.close(); await owner.close(); }
+});
+
+test('tell guidance sent while a busy remote window starts /complete before reading it is kept as undelivered in its handoff', async () => {
+  const name = profile();
+  let releaseWork = () => {};
+  const work = new Promise<void>(resolve => { releaseWork = resolve; });
+  const owner = await rpc(name);
+  const window = await rpc(name, undefined, 'rpc', true, request => request === 'Slow step.' ? work : undefined);
+  try {
+    await window.ask('First turn.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes(`[${id}] User started`));
+    await owner.ask('Drain start notice.');
+
+    // Start a busy turn in the window, send tell while it is busy (steered, not yet read), then /complete aborts the turn.
+    const busy = window.ask('Slow step.');
+    await until(() => window.sent.some(s => s.last === 'Slow step.'));
+    assert.equal(await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Check edge case X.' })}`), 'Reply: Message sent to the connected window.');
+    // Let the socket event reach the window and queue the steer, then /complete aborts the held turn.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const completing = window.ask('/complete');
+    await busy;
+    await completing;
+
+    // The handoff request itself names the undelivered guidance, and the window's final handoff includes it explicitly.
+    const handoffPrompt = window.sent.find(s => s.last.startsWith(HANDOFF_REQUEST))?.last ?? '';
+    assert.match(handoffPrompt, /Messages queued for you that you never got:\n\[Main agent guidance\]\nCheck edge case X\./);
+    assert.ok(!window.sent.some(s => s.last === '[Main agent guidance]\nCheck edge case X.'), 'the steered guidance never started a turn');
+    const handoffOf = (s: { last: string }) => new RegExp(`^\\[${id}\\] Connected conversation completed by user`).test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.match(delivered, /Messages queued but NOT delivered to the agent:\n\[Main agent guidance\]\nCheck edge case X\./);
+  } finally { releaseWork(); await window.close(); await owner.close(); }
+});
+
+test('when a remote window\'s /complete handoff turn fails, unread guidance stays explicitly undelivered in the owner\'s compactor fallback (never ordinary MAIN AGENT input)', async () => {
+  const name = profile();
+  let releaseWork = () => {};
+  const work = new Promise<void>(resolve => { releaseWork = resolve; });
+  const owner = await rpc(name);
+  const window = await rpc(name, undefined, 'rpc', true, request =>
+    request === 'Slow step.' ? work : request.startsWith(HANDOFF_REQUEST) ? Promise.reject(new Error('handoff model down')) : undefined);
+  try {
+    await window.ask('First turn.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes(`[${id}] User started`));
+    await owner.ask('Drain start notice.');
+
+    // Queue tell while busy, then /complete aborts the turn and the window's own handoff model turn fails.
+    const busy = window.ask('Slow step.');
+    await until(() => window.sent.some(s => s.last === 'Slow step.'));
+    assert.equal(await owner.ask(`CALL tell ${JSON.stringify({ id, message: 'Do not deploy yet.' })}`), 'Reply: Message sent to the connected window.');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const completing = window.ask('/complete');
+    await busy;
+    await completing;
+
+    // The owner falls back to the compactor: the guidance must appear ONLY as undelivered, never as ordinary MAIN AGENT input.
+    const handoffOf = (s: { last: string }) => new RegExp(`^\\[${id}\\] Connected conversation completed by user`).test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const compactorInput = owner.sent.find(s => s.system.includes('handoff') && s.last.includes('First turn.'))?.last ?? '';
+    assert.match(compactorInput, /Messages queued but NOT delivered to this agent:\n\[Main agent guidance\]\nDo not deploy yet\./);
+    assert.doesNotMatch(compactorInput, /MAIN AGENT: \[Main agent guidance\]\nDo not deploy yet\./);
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.match(delivered, /Summary:/, 'the owner compactor wrote the fallback summary');
+    assert.match(delivered, /Messages queued but NOT delivered to the agent:\n\[Main agent guidance\]\nDo not deploy yet\./);
+  } finally { releaseWork(); await window.close(); await owner.close(); }
+});
+
+test('a child subagent report queued while a remote window is busy before /complete stays as an unread report in the handoff without steering it', async () => {
+  const name = profile();
+  let releaseChild = () => {}, releaseWork = () => {};
+  const childWork = new Promise<void>(resolve => { releaseChild = resolve; });
+  const slowWork = new Promise<void>(resolve => { releaseWork = resolve; });
+  const owner = await rpc(name, undefined, 'rpc', true, request => request.endsWith('bg check') ? childWork : undefined);
+  const window = await rpc(name, undefined, 'rpc', true, request => request === 'Slow step.' ? slowWork : undefined);
+  try {
+    await window.ask(`CALL spawn ${JSON.stringify({ tasks: [{ task: 'bg check' }] })}`);
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    const [child] = readRuns(profilePath(name)).filter(run => run.task === 'bg check');
+    assert.ok(child);
+
+    // Window starts a busy turn; while busy, the child finishes and its report reaches the window's steering queue; then /complete runs before the next tool boundary.
+    const busy = window.ask('Slow step.');
+    await until(() => window.sent.some(s => s.last === 'Slow step.'));
+    releaseChild();
+    await until(() => readRuns(profilePath(name)).find(run => run.id === child.id)?.state === 'completed');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const completing = window.ask('/complete');
+    await busy;
+    await completing;
+
+    // The child report did not steer the handoff turn, was named as unread in the handoff prompt, and appears in the delivered handoff.
+    const handoffPrompt = window.sent.find(s => s.last.startsWith(HANDOFF_REQUEST))?.last ?? '';
+    assert.match(handoffPrompt, new RegExp(`Reports from your subagents that you never read:[\\s\\S]*\\[${child.id}\\] Reply:`));
+    assert.ok(!window.sent.some(s => s.last.startsWith(`[${child.id}] Reply:`)), 'the queued report did not steer into a turn');
+    const handoffOf = (s: { last: string }) => new RegExp(`^\\[${id}\\] Connected conversation completed by user`).test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.match(delivered, /Handoff: the user asked about the colour/);
+    assert.match(delivered, new RegExp(`Subagent reports that arrived while this conversation ended:[\\s\\S]*\\[${child.id}\\] Reply:`));
+  } finally { releaseChild(); releaseWork(); await window.close(); await owner.close(); }
+});
+
+test('branching back before /complete and adding a new finding keeps it in both the compactor handoff and zoom', async () => {
+  const name = profile(), owner = await rpc(name), window = await rpc(name);
+  try {
+    await window.ask('Initial question.');
+    await window.ask('/complete');
+    const firstId = window.role()?.role === 'window' ? (window.role() as Extract<Role, { role: 'window' }>).id : '';
+    await until(() => logged(name).some(text => text.includes(`[${firstId}] Connected conversation`)) && !owner.session.isStreaming);
+
+    // Branch back to before `/complete` and resume the session, then add a new finding and close without `/complete`.
+    const beforeComplete = window.session.sessionManager.getEntries().find(e => e.type === 'message' && e.message.role === 'assistant');
+    window.session.sessionManager.branch(beforeComplete!.id);
+    await window.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+    await window.session.extensionRunner.emit({ type: 'session_start', reason: 'resume' });
+    await window.ask('New branch finding: root cause is missing index.');
+    const secondId = window.role()?.role === 'window' ? (window.role() as Extract<Role, { role: 'window' }>).id : '';
+    assert.ok(secondId && secondId !== firstId);
+
+    let settled = false;
+    const off = owner.session.subscribe(event => {
+      if (event.type === 'agent_settled' && owner.sent.some(s => s.last.includes(`[${secondId}] Connected conversation interrupted`))) settled = true;
+    });
+    try {
+      await window.close();
+      await until(() => settled);
+    } finally { off(); }
+
+    const compactorInput = owner.sent.find(s => s.system.includes('handoff') && s.last.includes(`AGENT ${secondId}`))?.last ?? '';
+    assert.match(compactorInput, /New branch finding: root cause is missing index\./, 'branched finding survives in compactor input');
+    const zoomed = await owner.ask(`CALL zoom ${JSON.stringify({ id: secondId })}`);
+    assert.match(zoomed ?? '', /New branch finding: root cause is missing index\./, 'branched finding survives in zoom');
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('a verification tool call run during a failing /complete handoff is preserved in the compactor fallback and zoom', async () => {
+  const name = profile();
+  const owner = await rpc(name);
+  let handoffStep = 0;
+  const window = await rpc(name, undefined, 'rpc', true, (request, lastRole) => {
+    if (request.startsWith(HANDOFF_REQUEST) && handoffStep === 0) {
+      handoffStep = 1;
+      return `CALL models ${JSON.stringify({})}`;
+    }
+    if (lastRole === 'toolResult' && handoffStep === 1) {
+      handoffStep = 2;
+      return Promise.reject(new Error('handoff failed after verification'));
+    }
+    return undefined;
+  });
+  try {
+    await window.ask('Check the setup.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    let settled = false;
+    const off = owner.session.subscribe(event => {
+      if (event.type === 'agent_settled' && owner.sent.some(s => s.last.includes(`[${id}] Connected conversation completed by user`))) settled = true;
+    });
+    try {
+      await window.ask('/complete');
+      await until(() => settled);
+    } finally { off(); }
+
+    const compactorInput = owner.sent.find(s => s.system.includes('handoff') && s.last.includes(`AGENT ${id}`))?.last ?? '';
+    assert.match(compactorInput, /TOOL CALL: models/, 'verification tool call is kept for the compactor');
+    assert.match(compactorInput, /TOOL RESULT \(models, error=false\):/, 'verification tool result is kept for the compactor');
+    const zoomed = await owner.ask(`CALL zoom ${JSON.stringify({ id })}`);
+    assert.match(zoomed ?? '', /tool\|models/, 'verification tool call is kept in zoom');
+    assert.match(zoomed ?? '', /echo\|models:/, 'verification tool result is kept in zoom');
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('a remote window whose written /complete handoff is itself JSON is delivered intact, never mistaken for a protocol envelope', async () => {
+  const name = profile(), owner = await rpc(name);
+  const jsonSummary = JSON.stringify({ conclusion: 'Ready to ship', checks: ['unit', 'e2e'] });
+  const window = await rpc(name, undefined, 'rpc', true, request => request.startsWith(HANDOFF_REQUEST) ? jsonSummary : undefined);
+  try {
+    await window.ask('Give me a JSON summary.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    await window.ask('/complete');
+    const handoffOf = (s: { last: string }) => new RegExp(`^\\[${id}\\] Connected conversation completed by user`).test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.ok(delivered.includes(jsonSummary), 'the JSON handoff text arrives verbatim');
+    assert.ok(!owner.sent.some(s => s.system.includes('handoff') && s.last.includes(`AGENT ${id}`)), 'compactor fallback is not invoked');
   } finally { await window.close(); await owner.close(); }
 });
 

@@ -15,6 +15,8 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 /** What a registered window may still ask: its agent and conversation are its own, its subagents run here. The reply to
  * `register` lists them, so a window knows what an older owner can't do. */
 const REMOTE_ACTIONS: readonly Action[] = ['handoff', 'tell-main', 'spawn', 'tell', 'models', 'completing'];
+/** Capabilities advertised in the `register` reply: every remote action plus `handoff-meta` (`undelivered`/`unread` fields on `handoff` frames). */
+const REMOTE_CAPABILITIES = [...REMOTE_ACTIONS, 'handoff-meta'].join(' ');
 const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
 /** Stays under the 4 MB frame bound even when JSON escapes some characters. */
 const ANSWER_LIMIT = 1_000_000;
@@ -110,10 +112,12 @@ export async function serveWindows(directory: string, children: Children, availa
             if (!isRemoteWindow(window)) throw new Error('Invalid window registration');
             await children.adopt(window);
             child = window.id; remote = true;
-            // Its subagents' reports and messages: the window's agent gets them as it would a report (rpc-window.ts).
-            // Cut to fit a frame: the head names the agent, whose whole chat zoom reads.
-            disconnect = children.connectWindow(child, text => { send({ kind: 'event', name: 'message', text: shorten(text, ANSWER_LIMIT) }); return !socket.destroyed; });
-            send({ kind: 'reply', id: frame.id, text: REMOTE_ACTIONS.join(' ') }); return;
+            // Its subagents' reports and main-agent guidance: the window's agent gets them as it would a report (rpc-window.ts).
+            // Cut to fit a frame: the head names the agent, whose whole chat zoom reads. A window already in /complete takes neither.
+            if (!window.completing) {
+              disconnect = children.connectWindow(child, text => { send({ kind: 'event', name: 'message', text: shorten(text, ANSWER_LIMIT) }); return !socket.destroyed; }, { receives: !!window.receives });
+            }
+            send({ kind: 'reply', id: frame.id, text: REMOTE_CAPABILITIES }); return;
           } else if (frame.action === 'start') {
             if (child) throw new Error('This window already has a conversation');
             ready();
@@ -139,13 +143,14 @@ export async function serveWindows(directory: string, children: Children, availa
               if (!record(tell) || typeof tell.id !== 'string' || typeof tell.message !== 'string') throw new Error('An agent ID and a message are required');
               send({ kind: 'reply', id: frame.id, text: await children.guide(child, tell.id, tell.message) }); return;
             }
-            // /complete has begun: from now on its subagents report to the main chat, as once it has ended.
-            if (frame.action === 'completing') { disconnect?.(); send({ kind: 'reply', id: frame.id }); return; }
+            // /complete has begun: from now on its subagents report to the main chat, and tell refuses guidance.
+            if (frame.action === 'completing') { disconnect?.(); children.markCompleting(child); send({ kind: 'reply', id: frame.id }); return; }
             if (frame.action === 'models') { send({ kind: 'reply', id: frame.id, text: children.models(frame.text || undefined) }); return; }
             if (frame.action === 'handoff') {
               phase = 'closing';
+              const text = frame.text?.trim() || undefined;
               // Delivered (or saved for the next start) before the reply, so the window queues it if this owner fails it.
-              await children.endRemote(child, 'complete', frame.text?.trim() || undefined);
+              await children.endRemote(child, 'complete', { text, undelivered: frame.undelivered, unread: frame.unread });
               send({ kind: 'reply', id: frame.id }); return;
             }
             if (frame.action === 'answer') {

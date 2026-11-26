@@ -4,7 +4,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { atomicWrite } from './store.ts';
 import { record } from './core/cache.ts';
-import { textContent } from './transcript.ts';
+import { MAIN_GUIDANCE, REPORT_TYPE, textContent } from './transcript.ts';
 import { isFinishReason, readRun, type FinishReason, type Guidance, type RunInfo, type RunState } from './run-record.ts';
 
 export { readRun, runStates, type FinishReason, type Guidance, type RunInfo, type RunState } from './run-record.ts';
@@ -40,26 +40,37 @@ export function savedSession(run: RunInfo) {
 export function alive(pid: number) {
   try { process.kill(pid, 0); return true; } catch (error) { return record(error) && error.code === 'EPERM'; }
 }
-/** What a connected window in its own process tells the owner about itself (see `RunInfo.window`). */
-export type RemoteWindow = Pick<RunInfo, 'id' | 'task' | 'cwd' | 'model' | 'thinking' | 'title'> & NonNullable<RunInfo['window']>;
+/** What a connected window in its own process tells the owner about itself (see `RunInfo.window`).
+ * `receives`: the window handles incoming `message` events from the owner (absent on pi-optchat 0.12.2 and earlier).
+ * `completing`: `/complete` is already writing its handoff, so the owner must not send it guidance or reports. */
+export type RemoteWindow = Pick<RunInfo, 'id' | 'task' | 'cwd' | 'model' | 'thinking' | 'title'> & NonNullable<RunInfo['window']> & { receives?: boolean; completing?: boolean };
 /** A connected window still running in a Pi process of its own: only it can end its conversation. */
 export const runsElsewhere = (run: RunInfo) => !!run.window && isActiveRun(run);
 export function isRemoteWindow(value: unknown): value is RemoteWindow {
   return record(value) && ['id', 'task', 'cwd', 'model', 'thinking'].every(k => typeof value[k] === 'string') && /^[a-zA-Z0-9-]+$/.test(String(value.id))
     && Number.isSafeInteger(value.pid) && (value.title === undefined || typeof value.title === 'string')
     && (value.session === undefined || typeof value.session === 'string' && value.session.endsWith('.jsonl'))
-    && (value.after === undefined || typeof value.after === 'number');
+    && (value.after === undefined || typeof value.after === 'number')
+    && (value.receives === undefined || typeof value.receives === 'boolean')
+    && (value.completing === undefined || typeof value.completing === 'boolean');
 }
 /** A finished run's saved messages: for a window, only its own conversation (see `RunInfo.window`). */
 export function runMessages(run: RunInfo): AgentMessage[] {
-  const messages = run.sessionFile ? sessionMessages(run.sessionFile) : [], after = run.window?.after;
+  const messages = run.sessionFile ? sessionMessages(run.sessionFile, undelivered(run)) : [], after = run.window?.after;
   return after === undefined ? messages : messages.filter(message => message.timestamp >= after);
 }
+/** What a window that ended with `/complete` sends the owner (or queues for the next one): its handoff text plus any unread guidance/reports. */
+export interface RemoteHandoff { text?: string; undelivered?: string[]; unread?: string[] }
+const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');
+const isRemoteHandoff = (value: unknown): value is RemoteHandoff => record(value)
+  && (value.text === undefined || typeof value.text === 'string')
+  && (value.undelivered === undefined || isStringList(value.undelivered))
+  && (value.unread === undefined || isStringList(value.unread));
 /** A window that found no owner keeps itself here, in the profile directory, for the next owner to take: `reason` once it has
- * ended, with `text` if it wrote its own handoff. One without a reason whose process is gone was killed. */
-export type QueuedWindow = RemoteWindow & { reason?: FinishReason; text?: string };
+ * ended, with `text` if it wrote its own handoff (and `undelivered`/`unread` for messages it never read). One without a reason whose process is gone was killed. */
+export type QueuedWindow = RemoteWindow & RemoteHandoff & { reason?: FinishReason };
 const isQueuedWindow = (value: unknown): value is QueuedWindow => record(value)
-  && (value.reason === undefined || isFinishReason(value.reason)) && (value.text === undefined || typeof value.text === 'string') && isRemoteWindow(value);
+  && (value.reason === undefined || isFinishReason(value.reason)) && isRemoteHandoff(value) && isRemoteWindow(value);
 const queue = (profileDirectory: string) => join(profileDirectory, 'remote-windows');
 export const queueWindow = (profileDirectory: string, window: QueuedWindow) => atomicWrite(join(queue(profileDirectory), `${window.id}.json`), JSON.stringify(window));
 export const unqueueWindow = (profileDirectory: string, id: string) => rmSync(join(queue(profileDirectory), `${id}.json`), { force: true });
@@ -76,8 +87,37 @@ export function queuedWindows(profileDirectory: string): QueuedWindow[] {
 /** A connected run that has ended but whose handoff summary has not reached the main agent yet. */
 export const isHandingOff = (run: RunInfo) => !isActiveRun(run) && !!run.handoff && !run.handoff.delivered;
 export const CUT_OFF = 'Pi closed before this agent finished. Its partial transcript is retained.';
-export function sessionMessages(file: string): AgentMessage[] {
-  return SessionManager.open(file).getEntries().flatMap(e => e.type === 'message' ? [e.message] : []);
+/**
+ * Messages saved in a session file. `exclude` drops unread main-agent guidance that Pi's steering queue drained into a closing
+ * handoff turn after `/complete` aborted an active turn, so the compactor and `zoom` don't show it as read conversation.
+ */
+export function sessionMessages(file: string, exclude: readonly string[] = []): AgentMessage[] {
+  const entries = SessionManager.open(file).getEntries();
+  const skip = new Set<number>();
+  if (exclude.length) {
+    // Match from the end so an identical guidance message that really was read earlier stays in the transcript.
+    const remaining = new Map<string, number>();
+    for (const text of exclude) remaining.set(text, (remaining.get(text) ?? 0) + 1);
+    for (let i = entries.length - 1; i >= 0 && remaining.size; i--) {
+      const entry = entries[i];
+      if (entry.type !== 'custom_message' || entry.customType !== REPORT_TYPE) continue;
+      const body = textContent(entry.content);
+      const count = remaining.get(body) ?? 0;
+      if (count > 0) {
+        skip.add(i);
+        if (count === 1) remaining.delete(body); else remaining.set(body, count - 1);
+      }
+    }
+  }
+  return entries.flatMap((entry, i) => {
+    if (skip.has(i)) return [];
+    if (entry.type === 'message') return [entry.message];
+    // Main-agent guidance in a remote window is saved as an `optchat-report` custom message (rpc-window.ts); keep only that
+    // here so subagent reports aren't misattributed as user messages in handoffs or zoom.
+    if (entry.type === 'custom_message' && entry.customType === REPORT_TYPE && textContent(entry.content).startsWith(MAIN_GUIDANCE))
+      return [{ role: 'user' as const, content: entry.content, timestamp: Date.parse(entry.timestamp) }];
+    return [];
+  });
 }
 
 /** Metadata sits beside the SDK's canonical child transcripts, inside this profile. */

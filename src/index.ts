@@ -643,13 +643,13 @@ export default function optchat(pi: ExtensionAPI) {
     },
   });
   pi.registerTool(modelsTool(provider => rpcWindow ? rpcWindow.delegate('models', provider) : required().children.models(provider)));
-  pi.registerTool({ name: 'tell', label: 'Tell background agent', description: 'Send a message to a subagent. A running one gets it at its next tool boundary. A finished one you started is resumed with its earlier conversation, and its new report arrives automatically.',
+  pi.registerTool({ name: 'tell', label: 'Tell background agent', description: 'Send a message to a subagent or connected window. A running one gets it at its next tool boundary. A finished subagent you started is resumed with its earlier conversation, and its new report arrives automatically.',
     parameters: Type.Object({ id: Type.String(), message: Type.String() }),
     async execute(_id, args) { return result(rpcWindow ? await rpcWindow.delegate('tell', JSON.stringify(args)) : await required().children.tell(args.id, args.message)); },
   });
 
   pi.registerTool({ name: 'tell_main', label: 'Message main agent', defaultActive: false,
-    description: 'Send the main chat\'s agent a message while this conversation stays open: when the user asks you to tell it something, or for a finding it needs now. It can\'t answer you here, so ask the user when you need a reply. The handoff on Complete carries the rest, so don\'t repeat everything.',
+    description: 'Send the main chat\'s agent a message while this conversation stays open: when the user asks you to tell it something, or for a question or finding it needs now. Its reply can arrive as guidance; continue useful work instead of polling. The handoff on Complete carries the rest, so don\'t repeat everything.',
     parameters: Type.Object({ message: Type.String() }),
     async execute(_id, args) {
       if (!rpcWindow) throw new Error('Only a connected window has a main chat to message.');
