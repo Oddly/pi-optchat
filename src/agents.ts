@@ -467,17 +467,16 @@ export class Children {
     const { session } = live;
     const isCommand = text.startsWith('/') && !!session.extensionRunner.getCommand(text.slice(1).split(' ', 1)[0]);
     if (session.isStreaming && !isCommand) {
-      let sent: string | undefined, queued = false;
+      let sent: string | undefined, outcome: 'queued' | 'handled' | undefined;
       const attempt = live.steering.then(async () => {
-        if (!session.isStreaming) return;
-        if (await session.steer(text) === 'queued') {
-          queued = true;
-          sent = session.getSteeringMessages().at(-1);
-        }
+        if (!session.isStreaming || live.info.state === 'stopping' || live.interruption) return;
+        outcome = await session.steer(text);
+        if (outcome === 'queued') sent = session.getSteeringMessages().at(-1);
       });
       live.steering = attempt.catch(() => undefined);
       await attempt;
-      if (queued) {
+      if (outcome === 'handled') return;
+      if (outcome === 'queued') {
         if (guidance && sent !== undefined && sent !== guidance.text) guidance.sent = sent;
         await session.waitForIdle();
         // If the callback ended during steer()'s async input hooks, the message can sit orphaned in the idle queue;
@@ -495,8 +494,9 @@ export class Children {
         }
         return;
       }
+      if (live.info.state === 'stopping' || live.interruption) return;
     }
-    live.prompting = guidance;
+    if (!isCommand) live.prompting = guidance;
     try {
       await session.prompt(text, { streamingBehavior: 'steer' });
       // If a callback started streaming while prompt() awaited async input hooks, Pi queued it instead of starting a
