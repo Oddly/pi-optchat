@@ -282,6 +282,44 @@ test('a plain subagent waiting on its child keeps running when a child reports d
   } finally { gate?.release(); await callback?.catch(() => {}); await f.close(); }
 });
 
+test('a callback that finishes while steer() is still awaiting input hooks does not strand the message', async () => {
+  const f = await fixture();
+  let gate: ReturnType<typeof blockNextStart> | undefined, callback: Promise<void> | undefined;
+  const inputEntered = Promise.withResolvers<void>(), inputReleased = Promise.withResolvers<void>();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const live = f.children.live(id)!;
+    const runner = live.session.extensionRunner;
+    const origHas = runner.hasHandlers.bind(runner), origEmit = runner.emitInput.bind(runner);
+    let intercept = true;
+    runner.hasHandlers = (type: string) => (intercept && type === 'input') || origHas(type);
+    runner.emitInput = async (text, images, source) => {
+      if (intercept && text.includes('Survive callback end')) {
+        intercept = false;
+        inputEntered.resolve();
+        await inputReleased.promise;
+        return { action: 'continue' };
+      }
+      return origEmit(text, images, source);
+    };
+    gate = blockNextStart(live.session);
+    callback = live.session.sendCustomMessage({ customType: 'background-task', content: 'Background task succeeded.', display: true }, { triggerTurn: true });
+    await gate.entered;
+    await f.children.tell(id, 'Survive callback end', 'user');
+    await inputEntered.promise;
+    // Finish the callback run completely before steer() finishes its input hook.
+    gate.release();
+    await callback;
+    assert.equal(live.session.isStreaming, false);
+    inputReleased.resolve();
+    await until(() => live.info.state === 'waiting' && !live.session.isStreaming && f.requests.some(text => text.includes('Survive callback end')));
+    assert.equal(live.session.getSteeringMessages().length, 0);
+    assert.equal(f.requests.filter(text => text.includes('Survive callback end')).length, 1);
+    assert.deepEqual(live.info.guidance.map(g => g.state), ['delivered']);
+  } finally { gate?.release(); inputReleased.resolve(); await callback?.catch(() => {}); await f.close(); }
+});
+
 test('connected window keeps one real SDK conversation, communicates both ways, and completes its subtree with one handoff', async () => {
   const f = await fixture();
   // The compactor's handoff: the window fails to write its own.

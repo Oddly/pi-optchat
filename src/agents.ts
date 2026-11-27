@@ -458,33 +458,57 @@ export class Children {
    * tool result with `triggerTurn: true`). Passing `streamingBehavior: 'steer'` lets Pi queue it into the active run
    * instead of throwing, and we wait for idle so queueing is never mistaken for completion.
    *
-   * When `session.isStreaming` is already true we go through `steer()` so `live.steering` only serializes actual
-   * steering writes — never blocking concurrent `tell()` / `say` calls behind `before_agent_start` or pre-run
-   * compaction — and we avoid relying on Pi's internal `preflightResult` hook. If a callback starts a run during
-   * `session.prompt()`'s async input hooks, `streamingBehavior: 'steer'` still queues safely and `waitForIdle()` waits
-   * for it to settle.
+   * When `session.isStreaming` is already true (and the message isn't an extension command, which `steer()` rejects),
+   * we queue via `steer()` so `live.steering` only serializes actual steering writes — never blocking concurrent
+   * `tell()` / `say` calls behind `before_agent_start` or pre-run compaction. If the callback finishes before `steer()`
+   * runs, we fall through to `session.prompt()` instead of stranding the message in an idle session's steering queue.
    */
   private async prompt(live: LiveRun, text: string, guidance?: Guidance) {
     const { session } = live;
-    if (session.isStreaming) {
-      // Queue through steer() when a callback already owns the run, unless `text` is an extension command (steer()
-      // rejects those, whereas prompt() runs them immediately).
-      try {
-        const sent = await this.steer(live, text);
+    const isCommand = text.startsWith('/') && !!session.extensionRunner.getCommand(text.slice(1).split(' ', 1)[0]);
+    if (session.isStreaming && !isCommand) {
+      let sent: string | undefined, queued = false;
+      const attempt = live.steering.then(async () => {
+        if (!session.isStreaming) return;
+        if (await session.steer(text) === 'queued') {
+          queued = true;
+          sent = session.getSteeringMessages().at(-1);
+        }
+      });
+      live.steering = attempt.catch(() => undefined);
+      await attempt;
+      if (queued) {
         if (guidance && sent !== undefined && sent !== guidance.text) guidance.sent = sent;
         await session.waitForIdle();
+        // If the callback ended during steer()'s async input hooks, the message can sit orphaned in the idle queue;
+        // pull it back out and start a fresh prompt so it is never silently dropped.
+        const queuedText = sent ?? text;
+        const steering = session.getSteeringMessages();
+        const at = steering.indexOf(queuedText);
+        if (at >= 0 && !session.isStreaming && !live.interruption && live.info.state !== 'stopping') {
+          const rest = session.clearQueue().steering.filter((_, i) => i !== at);
+          if (rest.length) await this.requeue(live, rest);
+          live.prompting = guidance;
+          try { await session.prompt(queuedText, { expandPromptTemplates: false, streamingBehavior: 'steer' }); }
+          finally { live.prompting = undefined; }
+          await session.waitForIdle();
+        }
         return;
-      } catch (error) {
-        if (!text.startsWith('/')) throw error;
       }
     }
     live.prompting = guidance;
     try {
       await session.prompt(text, { streamingBehavior: 'steer' });
-      await session.waitForIdle();
+      // If a callback started streaming while prompt() awaited async input hooks, Pi queued it instead of starting a
+      // run; capture any expanded text before clearing live.prompting so an earlier queued message cannot claim it.
+      if (live.prompting && session.isStreaming) {
+        const sent = session.getSteeringMessages().at(-1);
+        if (sent !== undefined && sent !== live.prompting.text) live.prompting.sent = sent;
+      }
     } finally {
       live.prompting = undefined;
     }
+    await session.waitForIdle();
   }
   private async execute(live: LiveRun, prompt: string) {
     const { session, info } = live;
@@ -496,9 +520,11 @@ export class Children {
       await this.prompt(live, prompt, live.prompting);
       while (info.state !== 'stopping') {
         if (live.interruption) {
-          // Wait for the abort started by interrupt() to settle before clearing queues or prompting, so a callback run
-          // active while `waiting` cannot swallow the post-interrupt prompt into the dying turn.
+          // Wait for the abort started by interrupt() and any in-flight steer() to settle before clearing queues or
+          // prompting, so a callback run active while `waiting` cannot swallow the post-interrupt prompt into the
+          // dying turn and a late steer cannot re-enqueue a duplicate after clearQueue().
           await session.waitForIdle();
+          await live.steering;
           // A message Pi took during the abort (a rebuild of its queue can still be landing) went into a request the abort
           // cancelled, so it got no reply: it goes in this prompt too. Only a stop's undelivered ones stay out.
           const guidance = live.interruption.filter(g => g.state !== 'undelivered');
