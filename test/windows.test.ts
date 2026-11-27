@@ -180,7 +180,6 @@ for (const channel of ['guidance', 'skill guidance', 'parent report'] as const) 
     const handoff = await f.children.finish(id, 'complete');
     assert.equal(live.info.state, 'completed');
     assert.equal(handoff?.reason, 'complete');
-    assert.equal(live.info.failure, undefined);
   } finally { gate?.release(); await callback?.catch(() => {}); await f.close(); }
 });
 
@@ -199,31 +198,10 @@ test('an external callback updates the connected lifecycle without manager guida
     const handoff = await f.children.finish(id, 'disconnected');
     assert.equal(live.info.state, 'interrupted');
     assert.equal(handoff?.reason, 'disconnected');
-    assert.equal(live.info.failure, undefined);
   } finally { await f.close(); }
 });
 
-test('a connected handoff preserves the original dispatch exception and phase in its saved run', async () => {
-  const f = await fixture();
-  try {
-    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
-    await until(() => f.children.history.records.get(id)?.state === 'waiting');
-    const session = f.children.live(id)!.session, prompt = session.prompt.bind(session);
-    session.prompt = async (text, options) => {
-      if (text.includes('synthetic dispatch failure')) throw new Error('Synthetic dispatch failure');
-      return prompt(text, options);
-    };
-    await f.children.tell(id, 'synthetic dispatch failure');
-    await until(() => !f.children.live(id));
-    const run = readRun(f.dir, id);
-    assert.equal(run.state, 'interrupted');
-    assert.equal(run.handoff?.reason, 'failed');
-    assert.equal(run.report, run.handoff?.text);
-    assert.deepEqual(run.failure, { phase: 'guidance', message: 'Error: Synthetic dispatch failure' });
-  } finally { await f.close(); }
-});
-
-test('an external callback provider error remains distinguishable from a dispatch exception', async () => {
+test('an external callback provider error wakes the loop and ends the connected conversation with a failed handoff', async () => {
   const f = await fixture();
   try {
     const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
@@ -233,8 +211,75 @@ test('an external callback provider error remains distinguishable from a dispatc
     const run = readRun(f.dir, id);
     assert.equal(run.state, 'interrupted');
     assert.equal(run.handoff?.reason, 'failed');
-    assert.deepEqual(run.failure, { phase: 'response', message: 'Task error: Synthetic provider error' });
   } finally { await f.close(); }
+});
+
+test('interrupting a callback run held before agent_start delivers queued guidance as a fresh turn', async () => {
+  const f = await fixture();
+  let gate: ReturnType<typeof blockNextStart> | undefined, callback: Promise<void> | undefined;
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const live = f.children.live(id)!;
+    gate = blockNextStart(live.session);
+    callback = live.session.sendCustomMessage({ customType: 'background-task', content: 'Background task succeeded.', display: true }, { triggerTurn: true });
+    await gate.entered;
+    await f.children.tell(id, 'Drop the callback and check tests instead.', 'user');
+    const interrupted = f.children.interrupt(id);
+    gate.release();
+    assert.equal(await interrupted, 'continued');
+    await callback;
+    await until(() => live.info.state === 'waiting' && !live.session.isStreaming && f.requests.some(text => text.includes('Drop the callback and check tests instead.')));
+    assert.equal(live.info.handoff, undefined);
+    assert.deepEqual(live.info.guidance.map(g => g.state), ['delivered']);
+  } finally { gate?.release(); await callback?.catch(() => {}); await f.close(); }
+});
+
+test('a second tell does not block behind a prompt still running before_agent_start', async () => {
+  const f = await fixture();
+  let gate: ReturnType<typeof blockNextStart> | undefined;
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const live = f.children.live(id)!;
+    gate = blockNextStart(live.session);
+    await f.children.tell(id, 'First message.', 'user');
+    await gate.entered;
+    // A second tell while the first prompt is still in before_agent_start must return promptly, not wait for the gate.
+    const second = await Promise.race([
+      f.children.tell(id, 'Second message.', 'user'),
+      new Promise<'timed-out'>(resolve => setTimeout(() => resolve('timed-out'), 500)),
+    ]);
+    assert.notEqual(second, 'timed-out', 'tell must not block behind before_agent_start');
+    gate.release();
+    await until(() => live.info.state === 'waiting' && !live.session.isStreaming && live.info.guidance.every(g => g.state === 'delivered'));
+    assert.equal(live.session.messages.filter(m => m.role === 'user' && textContent(m.content).includes('First message.')).length, 1);
+    assert.equal(live.session.messages.filter(m => m.role === 'user' && textContent(m.content).includes('Second message.')).length, 1);
+  } finally { gate?.release(); await f.close(); }
+});
+
+test('a plain subagent waiting on its child keeps running when a child reports during an external callback', async () => {
+  const f = await fixture();
+  let gate: ReturnType<typeof blockNextStart> | undefined, callback: Promise<void> | undefined;
+  try {
+    const [parentId] = await f.children.spawn([{ task: 'spawn quick' }], f.dir);
+    await until(() => f.children.history.records.get(parentId)?.state === 'waiting'
+      && [...f.children.history.records.values()].some(run => run.parentId === parentId));
+    const parent = f.children.live(parentId)!;
+    const child = [...f.children.history.records.values()].find(run => run.parentId === parentId)!;
+    gate = blockNextStart(parent.session);
+    callback = parent.session.sendCustomMessage({ customType: 'background-task', content: 'Background task succeeded.', display: true }, { triggerTurn: true });
+    await gate.entered;
+    const tool = f.children.live(child.id)!.session.agent.state.tools.find(t => t.name === 'tell_parent')!;
+    await tool.execute('callback-child-report', { message: 'Child report during callback.' });
+    await until(() => parent.session.getSteeringMessages().some(text => text.includes('Child report during callback.')));
+    gate.release();
+    await callback;
+    await until(() => !f.children.live(parentId));
+    const run = readRun(f.dir, parentId);
+    assert.equal(run.state, 'completed');
+    assert.equal(f.requests.filter(text => text.includes('Child report during callback.')).length, 1);
+  } finally { gate?.release(); await callback?.catch(() => {}); await f.close(); }
 });
 
 test('connected window keeps one real SDK conversation, communicates both ways, and completes its subtree with one handoff', async () => {

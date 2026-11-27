@@ -453,34 +453,52 @@ export class Children {
     try { session.dispose(); } catch (error) { this.warn(`Subagent cleanup failed: ${String(error)}`); }
   }
   private directChildren(id: string) { return [...this.running.values()].filter(c => c.info.parentId === id); }
-  private async prompt(live: LiveRun, text: string) {
-    const { session, prompting: guidance } = live, admitted = Promise.withResolvers<void>();
-    live.prompting = undefined;
-    const submitted = live.steering.then(() => session.prompt(text, { streamingBehavior: 'steer', preflightResult: disposition => {
-      if (disposition === 'started') live.prompting = guidance;
-      if (disposition === 'queued' && guidance) {
-        const sent = session.getSteeringMessages().at(-1);
-        if (sent !== undefined && sent !== guidance.text) guidance.sent = sent;
+  /**
+   * Sends a prompt to a run whose session may already be streaming from an extension callback (e.g. a background
+   * tool result with `triggerTurn: true`). Passing `streamingBehavior: 'steer'` lets Pi queue it into the active run
+   * instead of throwing, and we wait for idle so queueing is never mistaken for completion.
+   *
+   * When `session.isStreaming` is already true we go through `steer()` so `live.steering` only serializes actual
+   * steering writes — never blocking concurrent `tell()` / `say` calls behind `before_agent_start` or pre-run
+   * compaction — and we avoid relying on Pi's internal `preflightResult` hook. If a callback starts a run during
+   * `session.prompt()`'s async input hooks, `streamingBehavior: 'steer'` still queues safely and `waitForIdle()` waits
+   * for it to settle.
+   */
+  private async prompt(live: LiveRun, text: string, guidance?: Guidance) {
+    const { session } = live;
+    if (session.isStreaming) {
+      // Queue through steer() when a callback already owns the run, unless `text` is an extension command (steer()
+      // rejects those, whereas prompt() runs them immediately).
+      try {
+        const sent = await this.steer(live, text);
+        if (guidance && sent !== undefined && sent !== guidance.text) guidance.sent = sent;
+        await session.waitForIdle();
+        return;
+      } catch (error) {
+        if (!text.startsWith('/')) throw error;
       }
-      admitted.resolve();
-    } }));
-    live.steering = admitted.promise;
-    try { await submitted; await admitted.promise; await session.waitForIdle(); }
-    finally { admitted.resolve(); }
+    }
+    live.prompting = guidance;
+    try {
+      await session.prompt(text, { streamingBehavior: 'steer' });
+      await session.waitForIdle();
+    } finally {
+      live.prompting = undefined;
+    }
   }
   private async execute(live: LiveRun, prompt: string) {
     const { session, info } = live;
-    let phase = 'start';
     try {
       if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${info.task}\n\nUse tell with this agent ID only if you know something it needs. It stays open between replies and sends a final handoff on completion or disconnect.`, { quiet: true });
       // A stop that lands before the first prompt has no turn to abort, so it is honoured here.
       const state: RunState = info.state; // a local, so the loop below still sees later state changes
       if (this.closing || info.handoff || state === 'stopping') throw new Error('Stopped before its first request.');
-      phase = 'initial-prompt';
-      try { await this.prompt(live, prompt); } finally { live.prompting = undefined; }
+      await this.prompt(live, prompt, live.prompting);
       while (info.state !== 'stopping') {
         if (live.interruption) {
-          phase = 'interrupt';
+          // Wait for the abort started by interrupt() to settle before clearing queues or prompting, so a callback run
+          // active while `waiting` cannot swallow the post-interrupt prompt into the dying turn.
+          await session.waitForIdle();
           // A message Pi took during the abort (a rebuild of its queue can still be landing) went into a request the abort
           // cancelled, so it got no reply: it goes in this prompt too. Only a stop's undelivered ones stay out.
           const guidance = live.interruption.filter(g => g.state !== 'undelivered');
@@ -518,15 +536,12 @@ export class Children {
         if (!paused && !session.isStreaming && last?.role === 'assistant' && (last.stopReason === 'error' || last.stopReason === 'aborted') && !live.pendingReports.length && !this.directChildren(info.id).length) break;
         if (live.pendingGuidance.length) {
           transition(info, 'running'); this.save(info);
-          live.prompting = live.pendingGuidance.shift()!;
-          // An extension command sends no message at all, so this can't outlive the prompt and claim a later one.
-          phase = 'guidance';
-          try { await this.prompt(live, live.prompting.text); } finally { live.prompting = undefined; }
+          const guidance = live.pendingGuidance.shift()!;
+          await this.prompt(live, guidance.text, guidance);
           continue;
         }
         if (live.pendingReports.length) {
           transition(info, 'running'); this.save(info);
-          phase = 'reports';
           await this.prompt(live, live.pendingReports.splice(0).join('\n\n'));
           continue;
         }
@@ -543,10 +558,8 @@ export class Children {
       const text = session.getLastAssistantText();
       info.report = info.state === 'stopped' && live.stoppedBy ? stoppedReport(live.stoppedBy, text)
         : last?.role === 'assistant' && (last.stopReason === 'error' || last.stopReason === 'aborted') ? `Task ${last.stopReason}: ${last.errorMessage ?? 'No details'}` : text || 'Finished without a text report.';
-      if (!info.handoff && !live.stoppedBy && last?.role === 'assistant' && (last.stopReason === 'error' || last.stopReason === 'aborted')) info.failure = { phase: 'response', message: info.report };
     } catch (error) {
       transition(info, info.state === 'stopping' ? 'stopped' : 'failed');
-      if (info.state === 'failed') info.failure = { phase, message: String(error) };
       info.report = info.state === 'stopped' && live.stoppedBy ? stoppedReport(live.stoppedBy, session.getLastAssistantText()) : `${info.state}: ${String(error)}`;
     } finally {
       const children = this.directChildren(info.id);
@@ -740,7 +753,7 @@ export class Children {
         await this.shutdown(session); this.dispose(session); throw new Error('Parent or profile is stopping.');
       }
       // The finished record stays untouched (and resumable) unless the new one is saved.
-      const { ended: _ended, cutOff: _cutOff, failure: _failure, ...rest } = run;
+      const { ended: _ended, cutOff: _cutOff, ...rest } = run;
       const cut = [...this.history.records.values()].filter(r => r.parentId === id && r.cutOff).map(r => r.id);
       const prompt = cutOffChildren(text, cut);
       const guidance: Guidance = { text: prompt, date: Date.now(), state: 'queued', from };
